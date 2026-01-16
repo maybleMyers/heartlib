@@ -77,7 +77,7 @@ Download our pretrained checkpoints from huggingface or modelscope using the fol
 ```
 # if you are using huggingface
 hf download --model 'HeartMuLa/HeartMuLaGen' --local_dir './ckpt'
-hf download --model 'HeartMuLa/HeartMuLa-3B-oss' --local_dir './ckpt/HeartMuLa-oss-3B'
+hf download --model 'HeartMuLa/HeartMuLa-oss-3B' --local_dir './ckpt/HeartMuLa-oss-3B'
 hf download --model 'HeartMuLa/HeartCodec-oss' --local_dir './ckpt/HeartCodec-oss'
 
 # if you are using modelscope
