@@ -179,12 +179,13 @@ class LogCapture:
             with self.lock:
                 timestamp = datetime.now().strftime("%H:%M:%S")
                 self.logs.append(f"[{timestamp}] {text.rstrip()}")
-        # Also print to original stdout
+        # Also print to original stdout/stderr
         sys.__stdout__.write(text)
         sys.__stdout__.flush()
 
     def flush(self):
         sys.__stdout__.flush()
+        sys.__stderr__.flush()
 
     def get_logs(self):
         with self.lock:
@@ -268,12 +269,15 @@ def generate_music(
     model_path: str,
     model_version: str,
     num_gpu_blocks: int,
+    model_dtype: str,
     progress=gr.Progress()
 ):
     """Generate music using HeartMuLa (loads model fresh each time to avoid OOM)."""
     log_capture.clear()
     old_stdout = sys.stdout
+    old_stderr = sys.stderr
     sys.stdout = log_capture
+    sys.stderr = log_capture
 
     pipe = None
     block_swap_manager = None
@@ -301,30 +305,57 @@ def generate_music(
         from heartlib import HeartMuLaGenPipeline
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+        # Map dtype string to torch dtype
+        dtype_map = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }
+        dtype = dtype_map.get(model_dtype, torch.bfloat16)
+        if not torch.cuda.is_available():
+            dtype = torch.float32
 
         log(f"Loading HeartMuLa-{model_version} from {model_path}...")
         log(f"Using device: {device}, dtype: {dtype}")
 
+        # Get total blocks for this model version
+        total_blocks = MODEL_LAYER_COUNTS.get(model_version, {}).get("backbone", 28)
+
+        # Determine if we need block swapping
+        use_block_swapping = num_gpu_blocks > 0 and num_gpu_blocks < total_blocks and torch.cuda.is_available()
+
+        # Load pipeline - skip automatic model move if using block swapping
         pipe = HeartMuLaGenPipeline.from_pretrained(
             model_path,
             device=device,
             dtype=dtype,
             version=model_version,
+            skip_model_move=use_block_swapping,
         )
-
-        # Ensure model is on correct device
-        pipe.model = pipe.model.to(device)
-        pipe.device = device
 
         progress(0.15, desc="Model loaded, setting up...")
 
-        # Get total blocks for this model version
-        total_blocks = MODEL_LAYER_COUNTS.get(model_version, {}).get("backbone", 28)
-
         # Set up block swapping if requested
-        if num_gpu_blocks > 0 and num_gpu_blocks < total_blocks and torch.cuda.is_available():
+        if use_block_swapping:
             log(f"Configuring block swapping: {num_gpu_blocks} blocks on GPU...")
+
+            # First move only the first N blocks to GPU
+            backbone = pipe.model.backbone
+            for i, layer in enumerate(backbone.layers):
+                if i < num_gpu_blocks:
+                    layer.to(device)
+
+            # Move non-layer components to GPU
+            pipe.model.text_embeddings.to(device)
+            pipe.model.audio_embeddings.to(device)
+            pipe.model.unconditional_text_embedding.to(device)
+            pipe.model.projection.to(device)
+            pipe.model.codebook0_head.to(device)
+            pipe.model.audio_head.data = pipe.model.audio_head.data.to(device)
+            pipe.model.muq_linear.to(device)
+            pipe.model.backbone.norm.to(device)
+            pipe.model.decoder.to(device)
 
             block_swap_manager = BlockSwapManager(pipe.model, num_gpu_blocks, device)
             if block_swap_manager.setup():
@@ -333,9 +364,11 @@ def generate_music(
                 log(block_swap_manager.get_memory_stats())
             else:
                 block_swap_manager = None
-                log("Block swapping setup failed, using full GPU mode")
+                log("Block swapping setup failed, moving all to GPU")
+                pipe.model.to(device)
         else:
             log(f"No block swapping: all {total_blocks} blocks on GPU")
+            pipe.model.to(device)
 
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
@@ -394,23 +427,38 @@ def generate_music(
         return None, error_msg, log_capture.get_logs()
     finally:
         sys.stdout = old_stdout
+        sys.stderr = old_stderr
         # Clean up to free GPU memory
         if block_swap_manager is not None:
             block_swap_manager.cleanup()
         if pipe is not None:
-            # Explicitly delete model components to release references
+            # Reset caches and move all model components to CPU before deletion
             if hasattr(pipe, 'model') and pipe.model is not None:
+                try:
+                    pipe.model.reset_caches()
+                except Exception:
+                    pass
+                pipe.model.to("cpu")
                 del pipe.model
             if hasattr(pipe, 'audio_codec') and pipe.audio_codec is not None:
+                pipe.audio_codec.to("cpu")
                 del pipe.audio_codec
             del pipe
         # Force garbage collection before clearing CUDA cache
+        # Run multiple gc passes to handle circular references
         import gc
-        gc.collect()
+        for _ in range(3):
+            gc.collect()
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            # Run gc again after cache clear
+            gc.collect()
             torch.cuda.empty_cache()
             allocated = torch.cuda.memory_allocated() / 1024**3
-            log(f"GPU Memory after cleanup: {allocated:.2f}GB")
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            log(f"GPU Memory after cleanup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
 
 def add_tag(current_tags: str, new_tag: str) -> str:
@@ -476,6 +524,13 @@ with gr.Blocks(
                     value=14,
                     step=1,
                     info="Blocks to keep on GPU (0 = all on GPU, no swapping). 3B has 28 blocks."
+                )
+
+                model_dtype = gr.Dropdown(
+                    label="Model Precision",
+                    choices=["fp32", "bf16", "fp16"],
+                    value="fp32",
+                    info="fp32 = best quality (native), bf16 = balanced, fp16 = smallest VRAM"
                 )
 
             gr.Markdown("### Style Tags")
@@ -644,7 +699,7 @@ with gr.Blocks(
 
     generate_btn.click(
         fn=generate_music,
-        inputs=[lyrics_input, tags_input, max_duration, temperature, topk, cfg_scale, model_path, model_version, num_gpu_blocks],
+        inputs=[lyrics_input, tags_input, max_duration, temperature, topk, cfg_scale, model_path, model_version, num_gpu_blocks, model_dtype],
         outputs=[output_audio, output_info, console_output]
     )
 

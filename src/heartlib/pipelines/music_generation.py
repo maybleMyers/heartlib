@@ -36,9 +36,20 @@ class HeartMuLaGenPipeline(Pipeline):
         config: HeartMuLaGenConfig,
         device: torch.device,
         dtype: torch.dtype,
+        skip_model_move: bool = False,
     ):
-        super().__init__(model, dtype=dtype)
-        self.model = model
+        # Don't call super().__init__ with model if we want to skip the automatic .to(device)
+        # This allows block swapping to be set up before moving model to GPU
+        if skip_model_move:
+            # Manually set attributes that Pipeline.__init__ would set
+            self.model = model
+            self.device = device
+            self.dtype = dtype
+            self.framework = "pt"
+        else:
+            super().__init__(model, dtype=dtype)
+            self.model = model
+
         self.audio_codec = audio_codec
         self.muq_mulan = muq_mulan
         self.text_tokenizer = text_tokenizer
@@ -220,6 +231,7 @@ class HeartMuLaGenPipeline(Pipeline):
         dtype: torch.dtype,
         version: str,
         bnb_config: Optional[BitsAndBytesConfig] = None,
+        skip_model_move: bool = False,
     ):
 
         if os.path.exists(
@@ -260,4 +272,4 @@ class HeartMuLaGenPipeline(Pipeline):
                 f"Expected to find gen_config.json for HeartMuLa at {gen_config_path} but not found. Please check your folder {pretrained_path}."
             )
 
-        return cls(heartmula, heartcodec, None, tokenizer, gen_config, device, dtype)
+        return cls(heartmula, heartcodec, None, tokenizer, gen_config, device, dtype, skip_model_move)
