@@ -71,19 +71,23 @@ class HeartMuLaGenPipeline(Pipeline):
         self._muq_dim = model.config.muq_dim
 
     def _sanitize_parameters(self, **kwargs):
-        preprocess_kwargs = {"cfg_scale": kwargs.get("cfg_scale", 1.5)}
+        preprocess_kwargs = {
+            "cfg_scale": kwargs.get("cfg_scale", 1.5),
+            "negative_prompt": kwargs.get("negative_prompt", None),
+        }
         forward_kwargs = {
             "max_audio_length_ms": kwargs.get("max_audio_length_ms", 120_000),
             "temperature": kwargs.get("temperature", 1.0),
             "topk": kwargs.get("topk", 50),
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
+            "stop_check": kwargs.get("stop_check", None),
         }
         postprocess_kwargs = {
             "save_path": kwargs.get("save_path", "output.mp3"),
         }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
-    def preprocess(self, inputs: Dict[str, Any], cfg_scale: float):
+    def preprocess(self, inputs: Dict[str, Any], cfg_scale: float, negative_prompt: str = None):
 
         # process tags
         tags = inputs["tags"]
@@ -146,12 +150,29 @@ class HeartMuLaGenPipeline(Pipeline):
                 tensor = torch.cat([tensor, tensor], dim=0)
             return tensor
 
+        # process negative prompt for CFG
+        negative_tokens = None
+        if negative_prompt is not None and negative_prompt.strip():
+            negative_prompt = negative_prompt.lower()
+            # encapsulate with special <tag> and </tag> tokens (same format as positive tags)
+            if not negative_prompt.startswith("<tag>"):
+                negative_prompt = f"<tag>{negative_prompt}"
+            if not negative_prompt.endswith("</tag>"):
+                negative_prompt = f"{negative_prompt}</tag>"
+            negative_ids = self.text_tokenizer.encode(negative_prompt).ids
+            if negative_ids[0] != self.config.text_bos_id:
+                negative_ids = [self.config.text_bos_id] + negative_ids
+            if negative_ids[-1] != self.config.text_eos_id:
+                negative_ids = negative_ids + [self.config.text_eos_id]
+            negative_tokens = torch.tensor(negative_ids, dtype=torch.long)
+
         return {
             "tokens": _cfg_cat(tokens, cfg_scale),
             "tokens_mask": _cfg_cat(tokens_mask, cfg_scale),
             "muq_embed": _cfg_cat(muq_embed, cfg_scale),
             "muq_idx": [muq_idx] * bs_size,
             "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
+            "negative_tokens": negative_tokens,
         }
 
     def _forward(
@@ -161,17 +182,41 @@ class HeartMuLaGenPipeline(Pipeline):
         temperature: float,
         topk: int,
         cfg_scale: float,
+        stop_check: callable = None,
     ):
         prompt_tokens = model_inputs["tokens"]
         prompt_tokens_mask = model_inputs["tokens_mask"]
         continuous_segment = model_inputs["muq_embed"]
         starts = model_inputs["muq_idx"]
         prompt_pos = model_inputs["pos"]
+        negative_tokens = model_inputs.get("negative_tokens", None)
+
+        # Ensure model is on the correct device (may have been offloaded after previous generation)
+        model_device = next(self.model.parameters()).device
+        if model_device != self.device:
+            self.model.to(self.device)
 
         frames = []
 
         bs_size = 2 if cfg_scale != 1.0 else 1
-        self.model.setup_caches(bs_size)
+
+        # Move inputs to the correct device
+        prompt_tokens = prompt_tokens.to(self.device)
+        prompt_tokens_mask = prompt_tokens_mask.to(self.device)
+        continuous_segment = continuous_segment.to(self.device)
+        prompt_pos = prompt_pos.to(self.device)
+
+        # Compute negative embedding for CFG if provided
+        negative_embedding = None
+        if negative_tokens is not None:
+            negative_tokens = negative_tokens.to(self.device)
+            with torch.no_grad():
+                neg_embeds = self.model.text_embeddings(negative_tokens)
+                # Mean-pool across all tokens to get a single embedding
+                negative_embedding = neg_embeds.mean(dim=0, keepdim=False)
+
+        # Setup caches with explicit device to handle model being temporarily on CPU
+        self.model.setup_caches(bs_size, device=self.device)
         with torch.autocast(device_type=self.device.type, dtype=self._dtype):
             curr_token = self.model.generate_frame(
                 tokens=prompt_tokens,
@@ -182,6 +227,7 @@ class HeartMuLaGenPipeline(Pipeline):
                 cfg_scale=cfg_scale,
                 continuous_segments=continuous_segment,
                 starts=starts,
+                negative_embedding=negative_embedding,
             )
         frames.append(curr_token[0:1,])
 
@@ -205,6 +251,9 @@ class HeartMuLaGenPipeline(Pipeline):
         max_audio_frames = max_audio_length_ms // 80
 
         for i in tqdm(range(max_audio_frames)):
+            # Check for stop signal
+            if stop_check is not None and stop_check():
+                break
             curr_token, curr_token_mask = _pad_audio_token(curr_token)
             with torch.autocast(device_type=self.device.type, dtype=self._dtype):
                 curr_token = self.model.generate_frame(
@@ -216,6 +265,7 @@ class HeartMuLaGenPipeline(Pipeline):
                     cfg_scale=cfg_scale,
                     continuous_segments=None,
                     starts=None,
+                    negative_embedding=negative_embedding,
                 )
             if torch.any(curr_token[0:1, :] >= self.config.audio_eos_id):
                 break

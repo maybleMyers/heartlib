@@ -4,22 +4,39 @@ A simple web interface for generating music with HeartMuLa.
 """
 
 import gradio as gr
+from gradio import themes
+from gradio.themes.utils import colors
 import torch
 import tempfile
 import os
 import sys
 import io
 import threading
+import random
+import time
+import json
 from pathlib import Path
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from queue import Queue
 from datetime import datetime
+
+# Defaults file path
+HEARTMULA_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "heartmula_defaults.json")
 
 # Model layer counts for different versions
 MODEL_LAYER_COUNTS = {
     "3B": {"backbone": 28, "decoder": 3},
     "7B": {"backbone": 32, "decoder": 3},
 }
+
+# Global stop event for batch cancellation
+stop_event = threading.Event()
+
+
+def stop_generation():
+    """Signal to stop the current generation."""
+    stop_event.set()
+    return "Stopping..."
 
 
 def _params_to_device(module, device, non_blocking=True):
@@ -156,6 +173,46 @@ class BlockSwapManager:
         self.swapped_blocks = []
         self.buffers_initialized = False
 
+    def restore_state(self):
+        """Restore block swapping state after model was moved to CPU.
+
+        This is needed when the model is offloaded to CPU during generation
+        (e.g., for codec detokenization) and needs to be restored for the
+        next generation in a batch.
+        """
+        if not self.swapped_blocks:
+            return
+
+        backbone = self.model.backbone
+
+        # Move non-swapped blocks (first N blocks) back to GPU
+        for i in range(self.num_gpu_blocks):
+            if i < len(backbone.layers):
+                backbone.layers[i].to(self.device)
+
+        # Move non-layer components back to GPU
+        self.model.text_embeddings.to(self.device)
+        self.model.audio_embeddings.to(self.device)
+        self.model.unconditional_text_embedding.to(self.device)
+        self.model.projection.to(self.device)
+        self.model.codebook0_head.to(self.device)
+        self.model.audio_head.data = self.model.audio_head.data.to(self.device)
+        self.model.muq_linear.to(self.device)
+        backbone.norm.to(self.device)
+        self.model.decoder.to(self.device)
+
+        # Swapped blocks should stay on CPU - move their params back to CPU
+        # (they may have been moved to GPU by model.to(device) in _forward)
+        for i in self.swapped_blocks:
+            _params_to_device(backbone.layers[i], self.cpu_device, non_blocking=False)
+
+        # Ensure all buffers are on GPU
+        self.buffers_initialized = False
+        self._ensure_all_buffers_on_gpu()
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
     def get_memory_stats(self):
         """Get current GPU memory usage."""
         if torch.cuda.is_available():
@@ -165,41 +222,8 @@ class BlockSwapManager:
         return "CUDA not available"
 
 
-class LogCapture:
-    """Captures stdout/stderr and stores logs for display."""
-
-    def __init__(self):
-        self.logs = []
-        self.lock = threading.Lock()
-
-    def write(self, text):
-        if text.strip():
-            with self.lock:
-                timestamp = datetime.now().strftime("%H:%M:%S")
-                self.logs.append(f"[{timestamp}] {text.rstrip()}")
-        # Also print to original stdout/stderr
-        sys.__stdout__.write(text)
-        sys.__stdout__.flush()
-
-    def flush(self):
-        sys.__stdout__.flush()
-        sys.__stderr__.flush()
-
-    def get_logs(self):
-        with self.lock:
-            return "\n".join(self.logs[-50:])  # Last 50 lines
-
-    def clear(self):
-        with self.lock:
-            self.logs = []
-
-
-# Global log capture
-log_capture = LogCapture()
-
-
 def log(message: str):
-    """Log a message to both console and capture buffer."""
+    """Log a message to the console."""
     print(message)
 
 
@@ -248,18 +272,34 @@ My furry friend"""
 # Default tags
 DEFAULT_TAGS = "piano,happy"
 
-# Example tag suggestions
-TAG_SUGGESTIONS = [
-    "piano", "guitar", "synthesizer", "drums", "violin", "bass",
-    "happy", "sad", "romantic", "energetic", "calm", "melancholic",
-    "pop", "rock", "jazz", "classical", "electronic", "folk",
-    "wedding", "party", "relaxation", "workout", "study", "sleep"
-]
+
+# Maximum number of audio outputs in the UI
+MAX_AUDIO_OUTPUTS = 12
+
+
+def create_audio_outputs(file_paths: list, labels: list = None) -> list:
+    """Create list of audio outputs for gr.Audio components.
+
+    Returns a list of MAX_AUDIO_OUTPUTS tuples, where each tuple is either
+    (filepath, label) or (None, None) for empty slots.
+    """
+    if labels is None:
+        labels = [os.path.basename(p) for p in file_paths] if file_paths else []
+
+    outputs = []
+    for i in range(MAX_AUDIO_OUTPUTS):
+        if i < len(file_paths):
+            outputs.append(gr.update(value=file_paths[i], label=labels[i], visible=True))
+        else:
+            outputs.append(gr.update(value=None, visible=False))
+
+    return outputs
 
 
 def generate_music(
     lyrics: str,
     tags: str,
+    negative_prompt: str,
     max_duration_seconds: float,
     temperature: float,
     topk: int,
@@ -268,36 +308,80 @@ def generate_music(
     model_version: str,
     num_gpu_blocks: int,
     model_dtype: str,
-    progress=gr.Progress()
+    batch_count: int,
+    seed: int,
+    output_folder: str,
 ):
-    """Generate music using HeartMuLa (loads model fresh each time to avoid OOM)."""
-    log_capture.clear()
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    sys.stdout = log_capture
-    sys.stderr = log_capture
+    """Generate music using HeartMuLa with batch support.
+
+    Yields: (file_list, status_text)
+    """
+    global stop_event
+    stop_event.clear()
 
     pipe = None
     block_swap_manager = None
+    all_generated_music = []
+    all_seeds = []
+    batch_count = int(batch_count)
+    seed = int(seed)
+
+    def cleanup():
+        """Clean up GPU memory."""
+        nonlocal pipe, block_swap_manager
+        if block_swap_manager is not None:
+            block_swap_manager.cleanup()
+        if pipe is not None:
+            if hasattr(pipe, 'model') and pipe.model is not None:
+                try:
+                    pipe.model.reset_caches()
+                except Exception:
+                    pass
+                pipe.model.to("cpu")
+                del pipe.model
+            if hasattr(pipe, 'audio_codec') and pipe.audio_codec is not None:
+                pipe.audio_codec.to("cpu")
+                del pipe.audio_codec
+            del pipe
+        import gc
+        for _ in range(3):
+            gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            log(f"GPU Memory after cleanup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
     try:
         # Validate inputs
         if not model_path or not os.path.exists(model_path):
-            return None, f"Model path does not exist: {model_path}", ""
+            yield (*create_audio_outputs([]), f"Model path does not exist: {model_path}")
+            return
 
         if not lyrics.strip():
-            return None, "Please enter some lyrics.", ""
+            yield (*create_audio_outputs([]), "Please enter some lyrics.")
+            return
 
         if not tags.strip():
-            return None, "Please enter at least one tag (e.g., 'piano,happy').", ""
+            yield (*create_audio_outputs([]), "Please enter at least one tag (e.g., 'piano,happy').")
+            return
+
+        # Create output folder
+        os.makedirs(output_folder, exist_ok=True)
 
         log("=" * 50)
-        log("Starting music generation...")
+        log(f"Starting batch generation ({batch_count} songs)...")
         log(f"Tags: {tags}")
+        if negative_prompt.strip():
+            log(f"Negative prompt: {negative_prompt}")
         log(f"Max duration: {max_duration_seconds}s")
         log(f"Temperature: {temperature}, Top-K: {topk}, CFG Scale: {cfg_scale}")
 
-        progress(0.1, desc="Loading model...")
+        yield (*create_audio_outputs([]), "Loading model...")
 
         # Load model fresh for this generation
         from heartlib import HeartMuLaGenPipeline
@@ -320,28 +404,29 @@ def generate_music(
         # Get total blocks for this model version
         total_blocks = MODEL_LAYER_COUNTS.get(model_version, {}).get("backbone", 28)
 
-        # Determine if we need block swapping
-        use_block_swapping = num_gpu_blocks > 0 and num_gpu_blocks < total_blocks and torch.cuda.is_available()
+        # Clamp num_gpu_blocks to total_blocks (0 means all blocks)
+        effective_gpu_blocks = min(num_gpu_blocks, total_blocks) if num_gpu_blocks > 0 else total_blocks
 
-        # Load pipeline - skip automatic model move if using block swapping
+        # Always use selective loading for better memory efficiency when CUDA available
+        use_selective_loading = torch.cuda.is_available()
+
+        # Load pipeline - skip automatic model move if using selective loading
         pipe = HeartMuLaGenPipeline.from_pretrained(
             model_path,
             device=device,
             dtype=dtype,
             version=model_version,
-            skip_model_move=use_block_swapping,
+            skip_model_move=use_selective_loading,
         )
 
-        progress(0.15, desc="Model loaded, setting up...")
+        # Set up selective loading for better memory management
+        if use_selective_loading:
+            log(f"Configuring selective loading: {effective_gpu_blocks} blocks on GPU...")
 
-        # Set up block swapping if requested
-        if use_block_swapping:
-            log(f"Configuring block swapping: {num_gpu_blocks} blocks on GPU...")
-
-            # First move only the first N blocks to GPU
+            # Move blocks to GPU one by one (more memory efficient than model.to())
             backbone = pipe.model.backbone
             for i, layer in enumerate(backbone.layers):
-                if i < num_gpu_blocks:
+                if i < effective_gpu_blocks:
                     layer.to(device)
 
             # Move non-layer components to GPU
@@ -355,239 +440,258 @@ def generate_music(
             pipe.model.backbone.norm.to(device)
             pipe.model.decoder.to(device)
 
-            block_swap_manager = BlockSwapManager(pipe.model, num_gpu_blocks, device)
-            if block_swap_manager.setup():
-                blocks_swapped = total_blocks - num_gpu_blocks
-                log(f"Block swapping ready: {num_gpu_blocks} on GPU, {blocks_swapped} swap from CPU")
-                log(block_swap_manager.get_memory_stats())
+            # Only set up block swapping if some blocks need to stay on CPU
+            if effective_gpu_blocks < total_blocks:
+                block_swap_manager = BlockSwapManager(pipe.model, effective_gpu_blocks, device)
+                if block_swap_manager.setup():
+                    blocks_swapped = total_blocks - effective_gpu_blocks
+                    log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_swapped} swap from CPU")
+                    log(block_swap_manager.get_memory_stats())
+                else:
+                    block_swap_manager = None
+                    log("Block swapping setup failed, keeping partial GPU load")
             else:
-                block_swap_manager = None
-                log("Block swapping setup failed, moving all to GPU")
-                pipe.model.to(device)
+                log(f"All {total_blocks} blocks on GPU (no swapping needed)")
+                log(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
         else:
-            log(f"No block swapping: all {total_blocks} blocks on GPU")
+            log(f"No selective loading: all {total_blocks} blocks on GPU")
             pipe.model.to(device)
 
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             log(f"GPU Memory after model load: {allocated:.2f}GB")
 
-        # Create a temporary file for output
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            output_path = f.name
-
         # Convert duration from seconds to milliseconds
         max_audio_length_ms = int(max_duration_seconds * 1000)
 
-        log(f"Output path: {output_path}")
-        log(f"Max audio length: {max_audio_length_ms}ms")
+        # Batch generation loop
+        for i in range(batch_count):
+            if stop_event.is_set():
+                log("Generation stopped by user.")
+                labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+                yield (*create_audio_outputs(all_generated_music, labels), "Stopped by user.")
+                return
 
-        progress(0.2, desc="Generating music (this may take a while)...")
-        log("Starting generation loop...")
+            # Handle seed
+            if seed == -1:
+                current_seed = random.randint(0, 2**32 - 1)
+            else:
+                current_seed = seed + i
 
-        with torch.no_grad():
-            pipe(
-                {
-                    "lyrics": lyrics,
-                    "tags": tags,
-                },
-                max_audio_length_ms=max_audio_length_ms,
-                save_path=output_path,
-                topk=topk,
-                temperature=temperature,
-                cfg_scale=cfg_scale,
-            )
+            all_seeds.append(current_seed)
 
-        progress(1.0, desc="Generation complete!")
-        log("Generation complete!")
+            # Set random seed for reproducibility
+            torch.manual_seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(current_seed)
+            random.seed(current_seed)
 
-        # Get memory info after generation
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            log(f"GPU Memory after generation: {allocated:.2f}GB")
+            status_text = f"Processing {i+1}/{batch_count} (Seed: {current_seed})"
+            labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+            yield (*create_audio_outputs(all_generated_music, labels), status_text)
 
-        # Build info message
-        info = f"""Generation Complete!
-- Duration: {max_duration_seconds:.1f}s (max)
-- Temperature: {temperature}
-- Top-K: {topk}
-- CFG Scale: {cfg_scale}
-- Tags: {tags}
-- Output: {output_path}"""
+            log(f"\n{'='*50}")
+            log(f"Generating song {i+1}/{batch_count} (Seed: {current_seed})")
 
-        return output_path, info, log_capture.get_logs()
+            # Create output path with timestamp and seed
+            timestamp = int(time.time())
+            output_filename = f"heartmula_{timestamp}_{current_seed}.mp3"
+            output_path = os.path.join(output_folder, output_filename)
+
+            log(f"Output path: {output_path}")
+            log("Starting generation loop...")
+
+            start_time = time.perf_counter()
+
+            with torch.no_grad():
+                pipe(
+                    {
+                        "lyrics": lyrics,
+                        "tags": tags,
+                    },
+                    max_audio_length_ms=max_audio_length_ms,
+                    save_path=output_path,
+                    topk=topk,
+                    temperature=temperature,
+                    cfg_scale=cfg_scale,
+                    negative_prompt=negative_prompt if negative_prompt.strip() else None,
+                    stop_check=stop_event.is_set,
+                )
+
+            elapsed = time.perf_counter() - start_time
+            log(f"Song {i+1} complete! ({elapsed:.1f}s)")
+
+            # Add file path to list
+            all_generated_music.append(output_path)
+
+            status_text = f"Completed {i+1}/{batch_count}"
+            labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+            yield (*create_audio_outputs(all_generated_music, labels), status_text)
+
+            # Get memory info after generation
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                log(f"GPU Memory after song {i+1}: {allocated:.2f}GB")
+
+            # Restore block swapping state for next generation in batch
+            if block_swap_manager is not None and i < batch_count - 1:
+                block_swap_manager.restore_state()
+
+        # Final status
+        final_status = f"Completed {batch_count} song(s)!" if batch_count > 1 else "Generation complete!"
+        log(f"\n{'='*50}")
+        log(final_status)
+        labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+        yield (*create_audio_outputs(all_generated_music, labels), final_status)
 
     except Exception as e:
         import traceback
         error_msg = f"Error during generation: {str(e)}"
         log(error_msg)
         log(traceback.format_exc())
-        return None, error_msg, log_capture.get_logs()
+        labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+        yield (*create_audio_outputs(all_generated_music, labels), error_msg)
     finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        # Clean up to free GPU memory
-        if block_swap_manager is not None:
-            block_swap_manager.cleanup()
-        if pipe is not None:
-            # Reset caches and move all model components to CPU before deletion
-            if hasattr(pipe, 'model') and pipe.model is not None:
-                try:
-                    pipe.model.reset_caches()
-                except Exception:
-                    pass
-                pipe.model.to("cpu")
-                del pipe.model
-            if hasattr(pipe, 'audio_codec') and pipe.audio_codec is not None:
-                pipe.audio_codec.to("cpu")
-                del pipe.audio_codec
-            del pipe
-        # Force garbage collection before clearing CUDA cache
-        # Run multiple gc passes to handle circular references
-        import gc
-        for _ in range(3):
-            gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            # Run gc again after cache clear
-            gc.collect()
-            torch.cuda.empty_cache()
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            log(f"GPU Memory after cleanup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-
-
-def add_tag(current_tags: str, new_tag: str) -> str:
-    """Add a tag to the current tags string."""
-    if not new_tag:
-        return current_tags
-
-    current_list = [t.strip() for t in current_tags.split(",") if t.strip()]
-    new_tag = new_tag.strip().lower()
-
-    if new_tag not in current_list:
-        current_list.append(new_tag)
-
-    return ",".join(current_list)
-
-
-def clear_tags() -> str:
-    """Clear all tags."""
-    return ""
+        cleanup()
 
 
 # Build the Gradio interface
 with gr.Blocks(
-    title="HeartMuLa Music Generator",
+    theme=themes.Default(
+        primary_hue=colors.Color(
+            name="heart_purple",
+            c50="#F5E6FF",
+            c100="#E0BAFF",
+            c200="#CA91FF",
+            c300="#B469FF",
+            c400="#9E40FF",
+            c500="#8816FF",
+            c600="#6B09D9",
+            c700="#5003B3",
+            c800="#38008C",
+            c900="#220066",
+            c950="#110033"
+        )
+    ),
+    css="""
+    .green-btn {
+        background: linear-gradient(to bottom right, #2ecc71, #27ae60) !important;
+        color: white !important;
+        border: none !important;
+    }
+    .green-btn:hover {
+        background: linear-gradient(to bottom right, #27ae60, #219651) !important;
+    }
+    """,
+    title="HeartMuLa Music Generator"
 ) as demo:
-    with gr.Row():
-        # Left column - Model & Input
-        with gr.Column(scale=1):
-            gr.Markdown("### Model Settings")
 
-            with gr.Group():
+    gr.Markdown("# HeartMuLa Music Generator")
+    gr.Markdown("AI-powered music generation with lyrics and style tags")
+
+    # Row 1: Main Inputs + Status
+    with gr.Row():
+        # Left column - Lyrics & Tags
+        with gr.Column(scale=3):
+            with gr.Accordion("Lyrics", open=False):
+                lyrics_input = gr.Textbox(
+                    label="Lyrics",
+                    placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
+                    value=DEFAULT_LYRICS,
+                    lines=12,
+                    max_lines=50,
+                    show_label=False
+                )
+            tags_input = gr.Textbox(
+                label="Style Tags",
+                placeholder="piano,happy,romantic",
+                value=DEFAULT_TAGS,
+                info="Comma-separated tags (e.g., piano,happy,romantic)"
+            )
+            negative_prompt_input = gr.Textbox(
+                label="Negative Prompt (Optional)",
+                placeholder="noise,distortion,low quality",
+                value="",
+                info="Comma-separated tags to avoid (e.g., noise,distortion)"
+            )
+            with gr.Row():
+                batch_count = gr.Number(label="Batch Count", value=1, minimum=1, step=1, scale=1)
+                seed = gr.Number(label="Seed (-1 = random)", value=-1, scale=1)
+                random_seed_btn = gr.Button("🎲", scale=0, min_width=40)
+
+        # Right column - Status
+        with gr.Column(scale=1):
+            status_text = gr.Textbox(label="Status", interactive=False, value="Ready", lines=3)
+
+    # Row 2: Buttons
+    with gr.Row():
+        generate_btn = gr.Button("🎵 Generate Music", variant="primary", elem_classes="green-btn")
+        stop_btn = gr.Button("⏹️ Stop", variant="stop")
+        save_defaults_btn = gr.Button("💾 Save Defaults")
+        load_defaults_btn = gr.Button("📂 Load Defaults")
+
+    # Row 3: Parameters + Output
+    with gr.Row():
+        # Left column - Parameters
+        with gr.Column():
+            with gr.Accordion("Model Settings", open=True):
                 model_path = gr.Textbox(
                     label="Model Path",
-                    placeholder="./ckpt",
                     value="./ckpt",
                     info="Path to the HeartMuLa checkpoint directory"
                 )
-
-                model_version = gr.Dropdown(
-                    label="Model Version",
-                    choices=["3B", "7B"],
-                    value="3B",
-                    info="HeartMuLa model size (7B not yet released)"
-                )
-
+                with gr.Row():
+                    model_version = gr.Dropdown(
+                        label="Model Version",
+                        choices=["3B", "7B"],
+                        value="3B",
+                        scale=1
+                    )
+                    model_dtype = gr.Dropdown(
+                        label="Precision",
+                        choices=["fp32", "bf16", "fp16"],
+                        value="bf16",
+                        scale=1
+                    )
                 num_gpu_blocks = gr.Slider(
-                    label="GPU Blocks (Block Swapping)",
+                    label="GPU Blocks",
                     minimum=0,
                     maximum=28,
                     value=14,
                     step=1,
-                    info="Blocks to keep on GPU (0 = all on GPU, no swapping). 3B has 28 blocks."
+                    info="Blocks on GPU (0 = all). Lower = less VRAM."
+                )
+                output_folder = gr.Textbox(
+                    label="Output Folder",
+                    value="./output",
+                    info="Directory to save generated music"
                 )
 
-                model_dtype = gr.Dropdown(
-                    label="Model Precision",
-                    choices=["fp32", "bf16", "fp16"],
-                    value="fp32",
-                    info="fp32 = best quality (native), bf16 = balanced, fp16 = smallest VRAM"
-                )
-
-            gr.Markdown("### Style Tags")
-            gr.Markdown("*Comma-separated tags (e.g., piano,happy,romantic)*")
-
-            with gr.Group():
-                tags_input = gr.Textbox(
-                    label="Tags",
-                    placeholder="piano,happy,romantic",
-                    value=DEFAULT_TAGS,
-                    info="Describe the style, mood, instruments"
-                )
-
-                gr.Markdown("**Quick Add Tags:**")
-                with gr.Row():
-                    tag_dropdown = gr.Dropdown(
-                        label="Select Tag",
-                        choices=TAG_SUGGESTIONS,
-                        scale=3
-                    )
-                    add_tag_btn = gr.Button("Add", scale=1)
-                    clear_tags_btn = gr.Button("Clear", scale=1)
-
-        # Middle column - Lyrics
-        with gr.Column(scale=1):
-            gr.Markdown("### Lyrics")
-            gr.Markdown("*Use section markers like [Verse], [Chorus], [Bridge], etc.*")
-
-            lyrics_input = gr.Textbox(
-                label="Lyrics",
-                placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
-                value=DEFAULT_LYRICS,
-                lines=20,
-                max_lines=30
-            )
-
-            with gr.Row():
-                clear_lyrics_btn = gr.Button("Clear Lyrics")
-                load_example_btn = gr.Button("Load Example")
-
-        # Right column - Generation Parameters & Output
-        with gr.Column(scale=1):
-            gr.Markdown("### Generation Parameters")
-
-            with gr.Group():
+            with gr.Accordion("Generation Parameters", open=True):
                 max_duration = gr.Slider(
                     label="Max Duration (seconds)",
                     minimum=10,
                     maximum=240,
                     value=120,
-                    step=10,
-                    info="Maximum length of generated audio"
+                    step=10
                 )
-
-                temperature = gr.Slider(
-                    label="Temperature",
-                    minimum=0.1,
-                    maximum=2.0,
-                    value=1.0,
-                    step=0.1,
-                    info="Higher = more random/creative, Lower = more deterministic"
-                )
-
-                topk = gr.Slider(
-                    label="Top-K",
-                    minimum=1,
-                    maximum=200,
-                    value=50,
-                    step=1,
-                    info="Number of top tokens to sample from"
-                )
-
+                with gr.Row():
+                    temperature = gr.Slider(
+                        label="Temperature",
+                        minimum=0.1,
+                        maximum=2.0,
+                        value=1.0,
+                        step=0.1,
+                        scale=1
+                    )
+                    topk = gr.Slider(
+                        label="Top-K",
+                        minimum=1,
+                        maximum=200,
+                        value=50,
+                        step=1,
+                        scale=1
+                    )
                 cfg_scale = gr.Slider(
                     label="CFG Scale (Guidance)",
                     minimum=1.0,
@@ -597,84 +701,23 @@ with gr.Blocks(
                     info="Higher = stronger adherence to tags/lyrics"
                 )
 
-            gr.Markdown("### Generate")
-
-            generate_btn = gr.Button("Generate Music", variant="primary", size="lg")
-
-            gr.Markdown("### Output")
-
-            output_audio = gr.Audio(
-                label="Generated Music",
-                type="filepath",
-                interactive=False
-            )
-
-            output_info = gr.Textbox(
-                label="Generation Info",
-                interactive=False,
-                lines=6
-            )
-
-    # Console output section
-    with gr.Accordion("Console Output", open=True):
-        console_output = gr.Textbox(
-            label="Logs",
-            interactive=False,
-            lines=15,
-            max_lines=30
-        )
-
-    # Advanced Settings (collapsible)
-    with gr.Accordion("Parameter Guide", open=False):
-        gr.Markdown(
-            """
-            ### Parameter Descriptions
-
-            | Parameter | Range | Default | Description |
-            |-----------|-------|---------|-------------|
-            | **Max Duration** | 10-240s | 120s | Maximum length of generated audio in seconds |
-            | **Temperature** | 0.1-2.0 | 1.0 | Controls randomness. Higher values produce more diverse but potentially less coherent results |
-            | **Top-K** | 1-200 | 50 | Limits sampling to top K most likely tokens. Lower values = more focused, higher = more diverse |
-            | **CFG Scale** | 1.0-5.0 | 1.5 | Classifier-Free Guidance. Higher values make the model follow tags/lyrics more strictly |
-
-            ### GPU Block Swapping
-
-            The **GPU Blocks** slider controls memory usage by swapping transformer blocks between GPU and CPU:
-            - **0 (default)**: All blocks on GPU (fastest, requires most VRAM ~12GB for 3B)
-            - **1-27**: Keep N blocks on GPU, swap remaining blocks from CPU as needed
-            - Lower values = less VRAM but slower generation
-
-            **Memory Guidelines for 3B Model:**
-            | GPU Blocks | Approx. VRAM | Speed |
-            |------------|--------------|-------|
-            | 28 (all)   | ~12GB        | Fastest |
-            | 20         | ~9GB         | Fast |
-            | 14         | ~6GB         | Medium |
-            | 7          | ~4GB         | Slower |
-
-            ### Tips for Better Results
-
-            1. **Lyrics Format**: Use section markers like `[Verse]`, `[Chorus]`, `[Bridge]`, `[Intro]`, `[Outro]`
-            2. **Tags**: Use descriptive tags for instruments (piano, guitar), mood (happy, sad), genre (pop, jazz)
-            3. **Temperature**: Start with 1.0, increase for more creativity or decrease for consistency
-            4. **CFG Scale**: Increase if the output doesn't match your tags/lyrics well
-
-            ### Supported Languages
-
-            HeartMuLa supports multilingual lyrics including:
-            - English
-            - Chinese (中文)
-            - Japanese (日本語)
-            - Korean (한국어)
-            - Spanish (Español)
-            """
-        )
+        # Right column - Output
+        with gr.Column():
+            audio_outputs = []
+            for i in range(MAX_AUDIO_OUTPUTS):
+                audio_outputs.append(gr.Audio(
+                    label=f"Song {i+1}",
+                    visible=False,
+                    interactive=False
+                ))
 
     # Event handlers
-    # Update slider based on model version
     def update_blocks_slider(version):
         max_blocks = MODEL_LAYER_COUNTS.get(version, {}).get("backbone", 28)
-        return gr.update(maximum=max_blocks, info=f"Blocks to keep on GPU (0 = all on GPU). {version} has {max_blocks} blocks.")
+        return gr.update(maximum=max_blocks, info=f"Blocks on GPU (0 = all). {version} has {max_blocks} blocks.")
+
+    def randomize_seed():
+        return random.randint(0, 2**32 - 1)
 
     model_version.change(
         fn=update_blocks_slider,
@@ -682,31 +725,95 @@ with gr.Blocks(
         outputs=[num_gpu_blocks]
     )
 
+    random_seed_btn.click(
+        fn=randomize_seed,
+        outputs=[seed]
+    )
+
     generate_btn.click(
         fn=generate_music,
-        inputs=[lyrics_input, tags_input, max_duration, temperature, topk, cfg_scale, model_path, model_version, num_gpu_blocks, model_dtype],
-        outputs=[output_audio, output_info, console_output]
+        inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
+                model_path, model_version, num_gpu_blocks, model_dtype,
+                batch_count, seed, output_folder],
+        outputs=audio_outputs + [status_text]
     )
 
-    add_tag_btn.click(
-        fn=add_tag,
-        inputs=[tags_input, tag_dropdown],
-        outputs=[tags_input]
+    stop_btn.click(
+        fn=stop_generation,
+        outputs=[status_text]
     )
 
-    clear_tags_btn.click(
-        fn=clear_tags,
-        outputs=[tags_input]
+    # Save/Load Defaults
+    # Components to save (in order)
+    defaults_components = [
+        lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
+        model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
+        max_duration, temperature, topk, cfg_scale
+    ]
+
+    # Keys for the defaults file (must match order of components)
+    defaults_keys = [
+        "lyrics", "tags", "negative_prompt", "batch_count", "seed",
+        "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
+        "max_duration", "temperature", "topk", "cfg_scale"
+    ]
+
+    def save_defaults(*values):
+        """Save current settings to defaults file."""
+        settings = {}
+        for i, key in enumerate(defaults_keys):
+            settings[key] = values[i]
+        try:
+            with open(HEARTMULA_DEFAULTS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+            return "Defaults saved successfully."
+        except Exception as e:
+            return f"Error saving defaults: {e}"
+
+    def load_defaults(request: gr.Request = None):
+        """Load settings from defaults file."""
+        if not os.path.exists(HEARTMULA_DEFAULTS_FILE):
+            if request:
+                return [gr.update()] * len(defaults_keys) + ["No defaults file found."]
+            else:
+                return [gr.update()] * len(defaults_keys) + [""]
+
+        try:
+            with open(HEARTMULA_DEFAULTS_FILE, 'r') as f:
+                loaded = json.load(f)
+        except Exception as e:
+            return [gr.update()] * len(defaults_keys) + [f"Error loading defaults: {e}"]
+
+        updates = []
+        for key in defaults_keys:
+            if key in loaded:
+                updates.append(gr.update(value=loaded[key]))
+            else:
+                updates.append(gr.update())
+
+        return updates + ["Defaults loaded successfully."]
+
+    save_defaults_btn.click(
+        fn=save_defaults,
+        inputs=defaults_components,
+        outputs=[status_text]
     )
 
-    clear_lyrics_btn.click(
-        fn=lambda: "",
-        outputs=[lyrics_input]
+    load_defaults_btn.click(
+        fn=load_defaults,
+        inputs=None,
+        outputs=defaults_components + [status_text]
     )
 
-    load_example_btn.click(
-        fn=lambda: DEFAULT_LYRICS,
-        outputs=[lyrics_input]
+    # Auto-load defaults on startup
+    def initial_load_defaults():
+        results = load_defaults(None)
+        return results[:-1]  # Exclude status message
+
+    demo.load(
+        fn=initial_load_defaults,
+        inputs=None,
+        outputs=defaults_components
     )
 
 
@@ -742,10 +849,12 @@ if __name__ == "__main__":
     print(f"Starting HeartMuLa Gradio UI on port {port}...")
     print(f"Open http://localhost:{port} in your browser")
 
+    # Enable queue for generator/streaming support
+    demo.queue()
+
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,
         share=args.share,
-        show_error=True,
-        theme=gr.themes.Soft()
+        show_error=True
     )

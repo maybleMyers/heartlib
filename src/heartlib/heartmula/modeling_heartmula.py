@@ -152,9 +152,10 @@ class HeartMuLa(PreTrainedModel):
         self.muq_linear = nn.Linear(config.muq_dim, backbone_dim)
         self.post_init()
 
-    def setup_caches(self, max_batch_size: int):
+    def setup_caches(self, max_batch_size: int, device: torch.device = None):
         dtype = next(self.parameters()).dtype
-        device = next(self.parameters()).device
+        if device is None:
+            device = next(self.parameters()).device
 
         try:
             self.reset_caches()
@@ -162,21 +163,25 @@ class HeartMuLa(PreTrainedModel):
             pass
 
         with device:
-            self.backbone.setup_caches(max_batch_size, dtype)
-            self.decoder.setup_caches(
-                max_batch_size,
-                dtype,
-                decoder_max_seq_len=self.config.audio_num_codebooks,
-            )
+            if not self.backbone.caches_are_enabled():
+                self.backbone.setup_caches(max_batch_size, dtype)
+            if not self.decoder.caches_are_enabled():
+                self.decoder.setup_caches(
+                    max_batch_size,
+                    dtype,
+                    decoder_max_seq_len=self.config.audio_num_codebooks,
+                )
 
-        self.register_buffer(
-            "backbone_causal_mask",
-            _create_causal_mask(self.backbone.max_seq_len, device),
-        )
-        self.register_buffer(
-            "decoder_causal_mask",
-            _create_causal_mask(self.config.audio_num_codebooks, device),
-        )
+        if not hasattr(self, "backbone_causal_mask") or self.backbone_causal_mask is None:
+            self.register_buffer(
+                "backbone_causal_mask",
+                _create_causal_mask(self.backbone.max_seq_len, device),
+            )
+        if not hasattr(self, "decoder_causal_mask") or self.decoder_causal_mask is None:
+            self.register_buffer(
+                "decoder_causal_mask",
+                _create_causal_mask(self.config.audio_num_codebooks, device),
+            )
 
     def generate_frame(
         self,
@@ -188,6 +193,7 @@ class HeartMuLa(PreTrainedModel):
         cfg_scale: float,
         continuous_segments: torch.Tensor = None,
         starts=None,
+        negative_embedding: torch.Tensor = None,
     ) -> torch.Tensor:
         b, s, _ = tokens.size()
 
@@ -204,15 +210,18 @@ class HeartMuLa(PreTrainedModel):
                 ]
             )
 
-        embeds = self._embed_tokens(tokens, uncond_mask=uncond_mask)
+        embeds = self._embed_tokens(tokens, uncond_mask=uncond_mask, negative_embedding=negative_embedding)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2, dtype=embeds.dtype)  # merge
         if continuous_segments is not None:
             continuous_segments = self.muq_linear(continuous_segments)
             if uncond_mask is not None:
-                uncond_embed = self.unconditional_text_embedding(
-                    torch.zeros(1, device=tokens.device, dtype=torch.long)
-                )
+                if negative_embedding is not None:
+                    uncond_embed = negative_embedding
+                else:
+                    uncond_embed = self.unconditional_text_embedding(
+                        torch.zeros(1, device=tokens.device, dtype=torch.long)
+                    )
                 mask_expanded = uncond_mask.view(b, 1).expand_as(continuous_segments)
                 continuous_segments = torch.where(
                     mask_expanded, uncond_embed, continuous_segments
@@ -288,15 +297,18 @@ class HeartMuLa(PreTrainedModel):
         return self.audio_embeddings(tokens + codebook * self.config.audio_vocab_size)
 
     def _embed_tokens(
-        self, tokens: torch.Tensor, uncond_mask: torch.Tensor | None
+        self, tokens: torch.Tensor, uncond_mask: torch.Tensor | None, negative_embedding: torch.Tensor | None = None
     ) -> torch.Tensor:
         B, S, _ = tokens.size()
         text_embeds = self.text_embeddings(tokens[:, :, -1])
 
         if uncond_mask is not None:
-            uncond_text_embed = self.unconditional_text_embedding(
-                torch.zeros(1, device=tokens.device, dtype=torch.long)
-            )
+            if negative_embedding is not None:
+                uncond_text_embed = negative_embedding
+            else:
+                uncond_text_embed = self.unconditional_text_embedding(
+                    torch.zeros(1, device=tokens.device, dtype=torch.long)
+                )
             mask_expanded = uncond_mask.view(B, 1, 1).expand_as(text_embeds)
             text_embeds = torch.where(
                 mask_expanded,
