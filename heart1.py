@@ -447,6 +447,8 @@ def generate_music(
                     blocks_swapped = total_blocks - effective_gpu_blocks
                     log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_swapped} swap from CPU")
                     log(block_swap_manager.get_memory_stats())
+                    # Prevent pipeline from moving entire model to GPU during generation
+                    pipe._skip_auto_move = True
                 else:
                     block_swap_manager = None
                     log("Block swapping setup failed, keeping partial GPU load")

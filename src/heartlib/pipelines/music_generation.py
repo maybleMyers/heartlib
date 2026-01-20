@@ -192,9 +192,11 @@ class HeartMuLaGenPipeline(Pipeline):
         negative_tokens = model_inputs.get("negative_tokens", None)
 
         # Ensure model is on the correct device (may have been offloaded after previous generation)
-        model_device = next(self.model.parameters()).device
-        if model_device != self.device:
-            self.model.to(self.device)
+        # Skip this check when block swapping is active, as some parameters are intentionally on CPU
+        if not getattr(self, '_skip_auto_move', False):
+            model_device = next(self.model.parameters()).device
+            if model_device != self.device:
+                self.model.to(self.device)
 
         frames = []
 

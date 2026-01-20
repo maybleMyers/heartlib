@@ -18,12 +18,41 @@
 
 ### 🖥️ Web GUI
 
-A Gradio-based web interface for easy music generation.
+A Gradio-based web interface for easy music generation.  
+
+We recommend using `python=3.10` for local deployment.  
+install uv then:
 
 ```bash
+git clone https://github.com/maybleMyers/heartlib
+cd heartlib
 uv sync
 uv run heart1.py
 ```
+
+Download the pretrained checkpoints from huggingface or modelscope using the following command:
+
+```
+# if you are using huggingface
+hf download --local-dir './ckpt' 'HeartMuLa/HeartMuLaGen'
+hf download --local-dir './ckpt/HeartMuLa-oss-3B' 'HeartMuLa/HeartMuLa-oss-3B'
+hf download --local-dir './ckpt/HeartCodec-oss' 'HeartMuLa/HeartCodec-oss'
+
+# if you are using modelscope
+modelscope download --model 'HeartMuLa/HeartMuLaGen' --local_dir './ckpt'
+modelscope download --model 'HeartMuLa/HeartMuLa-oss-3B' --local_dir './ckpt/HeartMuLa-oss-3B'
+modelscope download --model 'HeartMuLa/HeartCodec-oss' --local_dir './ckpt/HeartCodec-oss'
+```
+
+After downloading, the `./ckpt` subfolder should structure like this:
+```
+./ckpt/
+├── HeartCodec-oss/
+├── HeartMuLa-oss-3B/
+├── gen_config.json
+└── tokenizer.json
+```
+
 
 Then open http://localhost:7860 in your browser.
 
@@ -95,38 +124,7 @@ Join on Discord! [<img alt="join discord" src="https://img.shields.io/discord/84
 
 ### ⚙️ Environment Setup
 
-We recommend using `python=3.10` for local deployment.
 
-Clone this repo and install locally.
-
-```
-git clone https://github.com/HeartMuLa/heartlib.git
-cd heartlib
-pip install -e .
-```
-
-Download our pretrained checkpoints from huggingface or modelscope using the following command:
-
-```
-# if you are using huggingface
-hf download --local-dir './ckpt' 'HeartMuLa/HeartMuLaGen'
-hf download --local-dir './ckpt/HeartMuLa-oss-3B' 'HeartMuLa/HeartMuLa-oss-3B'
-hf download --local-dir './ckpt/HeartCodec-oss' 'HeartMuLa/HeartCodec-oss'
-
-# if you are using modelscope
-modelscope download --model 'HeartMuLa/HeartMuLaGen' --local_dir './ckpt'
-modelscope download --model 'HeartMuLa/HeartMuLa-oss-3B' --local_dir './ckpt/HeartMuLa-oss-3B'
-modelscope download --model 'HeartMuLa/HeartCodec-oss' --local_dir './ckpt/HeartCodec-oss'
-```
-
-After downloading, the `./ckpt` subfolder should structure like this:
-```
-./ckpt/
-├── HeartCodec-oss/
-├── HeartMuLa-oss-3B/
-├── gen_config.json
-└── tokenizer.json
-```
 
 
 ### ▶️ Example Usage
