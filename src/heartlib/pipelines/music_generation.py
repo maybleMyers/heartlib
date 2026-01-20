@@ -44,11 +44,23 @@ class HeartMuLaGenPipeline(Pipeline):
             # Manually set attributes that Pipeline.__init__ would set
             self.model = model
             self.device = device
-            self.dtype = dtype
+            self._dtype = dtype  # Use _dtype since dtype is a property
             self.framework = "pt"
+            # Set additional attributes that Pipeline base class sets
+            self._num_workers = None
+            self._batch_size = None
+            self._preprocess_params = {}
+            self._forward_params = {}
+            self._postprocess_params = {}
+            self.call_count = 0
+            self.tokenizer = None
+            self.feature_extractor = None
+            self.image_processor = None
+            self.processor = None
         else:
             super().__init__(model, dtype=dtype)
             self.model = model
+            self._dtype = dtype
 
         self.audio_codec = audio_codec
         self.muq_mulan = muq_mulan
@@ -97,7 +109,7 @@ class HeartMuLaGenPipeline(Pipeline):
         ref_audio = inputs.get("ref_audio", None)
         if ref_audio is not None:
             raise NotImplementedError("ref_audio is not supported yet.")
-        muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
+        muq_embed = torch.zeros([self._muq_dim], dtype=self._dtype)
         muq_idx = len(tags_ids)
 
         # process lyrics
@@ -160,7 +172,7 @@ class HeartMuLaGenPipeline(Pipeline):
 
         bs_size = 2 if cfg_scale != 1.0 else 1
         self.model.setup_caches(bs_size)
-        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+        with torch.autocast(device_type=self.device.type, dtype=self._dtype):
             curr_token = self.model.generate_frame(
                 tokens=prompt_tokens,
                 tokens_mask=prompt_tokens_mask,
@@ -194,7 +206,7 @@ class HeartMuLaGenPipeline(Pipeline):
 
         for i in tqdm(range(max_audio_frames)):
             curr_token, curr_token_mask = _pad_audio_token(curr_token)
-            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            with torch.autocast(device_type=self.device.type, dtype=self._dtype):
                 curr_token = self.model.generate_frame(
                     tokens=curr_token,
                     tokens_mask=curr_token_mask,
@@ -215,8 +227,19 @@ class HeartMuLaGenPipeline(Pipeline):
         self.model.to("cpu")
         torch.cuda.empty_cache()
 
+        # Move audio_codec to GPU for detokenization if it's on CPU
+        codec_was_on_cpu = next(self.audio_codec.parameters()).device.type == "cpu"
+        if codec_was_on_cpu:
+            self.audio_codec.to(self.device)
+
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         wav = self.audio_codec.detokenize(frames)
+
+        # Move audio_codec back to CPU if it was originally there
+        if codec_was_on_cpu:
+            self.audio_codec.to("cpu")
+            torch.cuda.empty_cache()
+
         return {"wav": wav}
 
     def postprocess(self, model_outputs: Dict[str, Any], save_path: str):
@@ -237,7 +260,9 @@ class HeartMuLaGenPipeline(Pipeline):
         if os.path.exists(
             heartcodec_path := os.path.join(pretrained_path, "HeartCodec-oss")
         ):
-            heartcodec = HeartCodec.from_pretrained(heartcodec_path, device_map=device)
+            # Load HeartCodec on CPU if skip_model_move (will be moved to GPU for detokenization)
+            codec_device = "cpu" if skip_model_move else device
+            heartcodec = HeartCodec.from_pretrained(heartcodec_path, device_map=codec_device)
         else:
             raise FileNotFoundError(
                 f"Expected to find checkpoint for HeartCodec at {heartcodec_path} but not found. Please check your folder {pretrained_path}."

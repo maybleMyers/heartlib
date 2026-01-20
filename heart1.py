@@ -148,12 +148,10 @@ class BlockSwapManager:
         return True
 
     def cleanup(self):
-        """Restore original forwards and move all blocks back to GPU."""
+        """Restore original forwards. Model will be moved to CPU separately during full cleanup."""
         if hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'layers'):
             for i, orig_forward in self.original_forwards.items():
                 self.model.backbone.layers[i].forward = orig_forward
-            for layer in self.model.backbone.layers:
-                _params_to_device(layer, self.device, non_blocking=False)
         self.original_forwards = {}
         self.swapped_blocks = []
         self.buffers_initialized = False
@@ -484,19 +482,6 @@ def clear_tags() -> str:
 with gr.Blocks(
     title="HeartMuLa Music Generator",
 ) as demo:
-    gr.Markdown(
-        """
-        # HeartMuLa Music Generator
-
-        Generate music conditioned on lyrics and tags using HeartMuLa - a family of open-sourced music foundation models.
-
-        **Features:**
-        - Text-to-music generation with lyrics and style tags
-        - Support for multiple languages (English, Chinese, Japanese, Korean, Spanish)
-        - Adjustable generation parameters for creative control
-        """
-    )
-
     with gr.Row():
         # Left column - Model & Input
         with gr.Column(scale=1):
@@ -606,7 +591,7 @@ with gr.Blocks(
                 cfg_scale = gr.Slider(
                     label="CFG Scale (Guidance)",
                     minimum=1.0,
-                    maximum=5.0,
+                    maximum=12.0,
                     value=1.5,
                     step=0.1,
                     info="Higher = stronger adherence to tags/lyrics"
