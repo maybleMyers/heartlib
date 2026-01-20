@@ -593,15 +593,14 @@ with gr.Blocks(
     with gr.Row():
         # Left column - Lyrics & Tags
         with gr.Column(scale=3):
-            with gr.Accordion("Lyrics", open=False):
-                lyrics_input = gr.Textbox(
-                    label="Lyrics",
-                    placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
-                    value=DEFAULT_LYRICS,
-                    lines=12,
-                    max_lines=50,
-                    show_label=False
-                )
+            with gr.Accordion("Lyrics", open=True):
+                with gr.Row():
+                    lyrics_input = gr.Textbox(
+                        label="main lyric prompt",
+                        placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
+                        value=DEFAULT_LYRICS,
+                        lines=12,
+                    )
             tags_input = gr.Textbox(
                 label="Style Tags",
                 placeholder="piano,happy,romantic",
