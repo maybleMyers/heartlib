@@ -398,9 +398,19 @@ def generate_music(
         if block_swap_manager is not None:
             block_swap_manager.cleanup()
         if pipe is not None:
+            # Explicitly delete model components to release references
+            if hasattr(pipe, 'model') and pipe.model is not None:
+                del pipe.model
+            if hasattr(pipe, 'audio_codec') and pipe.audio_codec is not None:
+                del pipe.audio_codec
             del pipe
+        # Force garbage collection before clearing CUDA cache
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            log(f"GPU Memory after cleanup: {allocated:.2f}GB")
 
 
 def add_tag(current_tags: str, new_tag: str) -> str:
