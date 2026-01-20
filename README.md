@@ -16,6 +16,11 @@
     
 </p>
 
+### To run the GUI
+uv sync
+uv run heart1.py  
+
+  
 ---
 # HeartMuLa: A Family of Open Sourced Music Foundation Models
 

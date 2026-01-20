@@ -5,42 +5,73 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heartlib"
 version = "0.1.0"
-description = "A Python Library."
+description = "HeartMuLa - A Family of Open Sourced Music Foundation Models"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "HeartMuLa Team", email = "heartmula.ai@gmail.com"}
 ]
 dependencies = [
-    "numpy==2.0.2",
-    "torch==2.4.1",
-    "torchaudio==2.4.1",
-    "torchtune==0.4.0",
-    "torchao==0.9.0",
-    "torchvision==0.19.1",
-    "tqdm==4.67.1",
-    "traitlets==5.7.1",
-    "traittypes==0.2.3",
-    "transformers==4.57.0",
-    "tokenizers==0.22.1",
-    "ipykernel==6.17.1",
-    "einops==0.8.1",
-    "accelerate==1.12.0",
-    "bitsandbytes==0.49.0",
-    "vector-quantize-pytorch==1.27.15",
-    "modelscope==1.33.0",
-    "soundfile"
+    # PyTorch ecosystem (CUDA versions resolved via uv index)
+    "torch>=2.4.1,<2.9",
+    "torchaudio>=2.4.1",
+    "torchvision>=0.19.1",
+    "torchtune>=0.4.0",
+    "torchao>=0.9.0",
+    # Core ML dependencies
+    "numpy>=2.0.2",
+    "transformers>=4.57.0",
+    "tokenizers>=0.22.1",
+    "accelerate>=1.12.0",
+    "bitsandbytes>=0.49.0",
+    "einops>=0.8.1",
+    "vector-quantize-pytorch>=1.27.15",
+    # Audio processing
+    "soundfile",
+    # Utilities
+    "tqdm>=4.67.1",
+    "traitlets>=5.7.1",
+    "traittypes>=0.2.3",
+    "ipykernel>=6.17.1",
+    "modelscope>=1.33.0",
+    # Gradio UI
+    "gradio>=5.23.1",
 ]
-urls = { "homepage" = "https://heartmula.github.io/" }
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Operating System :: OS Independent"
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://heartmula.github.io/"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# uv configuration for CUDA PyTorch
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
 

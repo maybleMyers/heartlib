@@ -197,6 +197,13 @@ class HeartMuLaGenPipeline(Pipeline):
             if torch.any(curr_token[0:1, :] >= self.config.audio_eos_id):
                 break
             frames.append(curr_token[0:1,])
+
+        # Offload HeartMuLa model to CPU to free GPU memory for detokenize
+        # This prevents OOM during the detokenize step
+        self.model.reset_caches()
+        self.model.to("cpu")
+        torch.cuda.empty_cache()
+
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         wav = self.audio_codec.detokenize(frames)
         return {"wav": wav}
