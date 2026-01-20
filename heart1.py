@@ -670,13 +670,42 @@ with gr.Blocks(
     )
 
 
+def find_available_port(start_port: int = 7860, max_attempts: int = 100) -> int:
+    """Find the first available port starting from start_port."""
+    import socket
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"Could not find available port in range {start_port}-{start_port + max_attempts}")
+
+
 if __name__ == "__main__":
-    print("Starting HeartMuLa Gradio UI...")
-    print("Open http://localhost:7860 in your browser")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="HeartMuLa Music Generation UI")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Server port. Auto-detects available port if not specified.")
+    parser.add_argument("--share", action="store_true",
+                        help="Create a public Gradio link.")
+    args = parser.parse_args()
+
+    # Determine port (auto-detect if not specified)
+    if args.port is not None:
+        port = args.port
+    else:
+        port = find_available_port(7860)
+
+    print(f"Starting HeartMuLa Gradio UI on port {port}...")
+    print(f"Open http://localhost:{port} in your browser")
+
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
+        server_port=port,
+        share=args.share,
         show_error=True,
         theme=gr.themes.Soft()
     )
