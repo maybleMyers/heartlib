@@ -17,7 +17,7 @@
 </p>
 
 ### 🖥️ Web GUI
-![heartlib-gui](examples/screenshot.jpg)
+![heartlib-gui](examples/screenshot.png)
 A Gradio-based web interface for easy music generation.  
 
 We recommend using `python=3.10` for local deployment.  
