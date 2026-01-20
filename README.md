@@ -16,11 +16,31 @@
     
 </p>
 
-### To run the GUI
-uv sync
-uv run heart1.py  
+### 🖥️ Web GUI
 
-  
+A Gradio-based web interface for easy music generation.
+
+```bash
+uv sync
+uv run heart1.py
+```
+
+Then open http://localhost:7860 in your browser.
+
+**Features:**
+- Configure model path, version, and GPU block swapping
+- Enter lyrics with section markers (`[Verse]`, `[Chorus]`, etc.)
+- Add style tags (instruments, mood, genre)
+- Adjust generation parameters (duration, temperature, top-k, CFG scale)
+
+**GPU Block Swapping:** Reduce VRAM usage by keeping only some transformer blocks on GPU. For the 3B model:
+
+| GPU Blocks | Approx. VRAM | Speed |
+|------------|--------------|-------|
+| 28 (all)   | ~20GB        | Fastest |
+| 14         | ~14GB         | Medium |
+| 7          | ~8GB         | Slower |
+
 ---
 # HeartMuLa: A Family of Open Sourced Music Foundation Models
 
