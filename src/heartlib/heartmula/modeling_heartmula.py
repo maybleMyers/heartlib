@@ -118,6 +118,7 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
 
 class HeartMuLa(PreTrainedModel):
     config_class = HeartMuLaConfig
+    _is_compiled = False
 
     def __init__(
         self,
@@ -183,6 +184,57 @@ class HeartMuLa(PreTrainedModel):
                 _create_causal_mask(self.config.audio_num_codebooks, device),
             )
 
+        # Pre-allocate reusable buffers to avoid per-frame allocations
+        self._cached_batch_size = max_batch_size
+        self._cached_device = device
+        actual_B = max_batch_size // 2 if max_batch_size > 1 else 1
+
+        # For uncond_mask in generate_frame - pre-concatenated
+        self.register_buffer(
+            "_uncond_mask",
+            torch.cat([
+                torch.zeros(actual_B, dtype=torch.bool, device=device),
+                torch.ones(actual_B, dtype=torch.bool, device=device),
+            ]),
+            persistent=False,
+        )
+
+        # For batch indices
+        self.register_buffer(
+            "_batch_indices",
+            torch.arange(max_batch_size, device=device),
+            persistent=False,
+        )
+
+        # For decoder positions - shape [batch_size, num_codebooks]
+        self.register_buffer(
+            "_decoder_pos_base",
+            torch.arange(self.config.audio_num_codebooks, device=device).unsqueeze(0).expand(max_batch_size, -1).contiguous(),
+            persistent=False,
+        )
+
+        # For unconditional embedding index
+        self.register_buffer(
+            "_zero_idx",
+            torch.zeros(1, device=device, dtype=torch.long),
+            persistent=False,
+        )
+
+        # Pre-allocate buffer for curr_sample output to avoid torch.cat in inner loop
+        self.register_buffer(
+            "_sample_buffer",
+            torch.zeros(max_batch_size, self.config.audio_num_codebooks, dtype=torch.long, device=device),
+            persistent=False,
+        )
+
+        # Pre-allocate buffer for decoder input (last_h + c0_embed concatenated)
+        backbone_dim = self.text_embeddings.embedding_dim
+        self.register_buffer(
+            "_decoder_input_buffer",
+            torch.zeros(max_batch_size, 2, backbone_dim, dtype=dtype, device=device),
+            persistent=False,
+        )
+
     def generate_frame(
         self,
         tokens: torch.Tensor,
@@ -200,15 +252,10 @@ class HeartMuLa(PreTrainedModel):
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
 
+        # Use pre-allocated uncond_mask instead of creating new tensors
         uncond_mask = None
         if cfg_scale > 1.0 and b > 1:
-            actual_B = b // 2
-            uncond_mask = torch.cat(
-                [
-                    torch.zeros(actual_B, dtype=torch.bool, device=tokens.device),
-                    torch.ones(actual_B, dtype=torch.bool, device=tokens.device),
-                ]
-            )
+            uncond_mask = self._uncond_mask
 
         embeds = self._embed_tokens(tokens, uncond_mask=uncond_mask, negative_embedding=negative_embedding)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
@@ -219,15 +266,14 @@ class HeartMuLa(PreTrainedModel):
                 if negative_embedding is not None:
                     uncond_embed = negative_embedding
                 else:
-                    uncond_embed = self.unconditional_text_embedding(
-                        torch.zeros(1, device=tokens.device, dtype=torch.long)
-                    )
+                    # Use pre-allocated zero index
+                    uncond_embed = self.unconditional_text_embedding(self._zero_idx)
                 mask_expanded = uncond_mask.view(b, 1).expand_as(continuous_segments)
                 continuous_segments = torch.where(
                     mask_expanded, uncond_embed, continuous_segments
                 )
-            batch_indices = torch.arange(h.shape[0], device=h.device)
-            h[batch_indices, starts] = continuous_segments
+            # Use pre-allocated batch indices
+            h[self._batch_indices[:b], starts] = continuous_segments
         h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
         last_h = h[:, -1, :]  # the last frame
         c0_logits = self.codebook0_head(last_h)  # only predict the audio part
@@ -246,14 +292,19 @@ class HeartMuLa(PreTrainedModel):
 
         c0_embed = self._embed_audio(0, c0_sample)
 
+        # Reset decoder caches once per frame
         self.decoder.reset_caches()
-        curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
-        curr_sample = c0_sample.clone()
-        curr_pos = (
-            torch.arange(0, curr_h.size(1), device=curr_h.device)
-            .unsqueeze(0)
-            .repeat(curr_h.size(0), 1)
-        )
+        # Use pre-allocated buffer instead of torch.cat
+        curr_h = self._decoder_input_buffer[:b]
+        curr_h[:, 0, :] = last_h
+        curr_h[:, 1, :] = c0_embed.squeeze(1)
+
+        # Use pre-allocated sample buffer instead of repeated torch.cat
+        curr_sample = self._sample_buffer[:b]
+        curr_sample[:, 0:1] = c0_sample
+
+        # Use pre-allocated decoder positions
+        curr_pos = self._decoder_pos_base[:b, :2]
         curr_h = curr_h.to(embeds.dtype)
         for i in range(1, self.config.audio_num_codebooks):
             curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
@@ -273,14 +324,43 @@ class HeartMuLa(PreTrainedModel):
                 ci_sample = sample_topk(ci_logits, topk, temperature)
             ci_embed = self._embed_audio(i, ci_sample)
             curr_h = ci_embed
-            curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            curr_pos = curr_pos[:, -1:] + 1
+            # Write directly to pre-allocated buffer instead of torch.cat
+            curr_sample[:, i:i+1] = ci_sample
+            # Use pre-allocated position for next iteration (positions 2,3,4,5,6,7)
+            curr_pos = self._decoder_pos_base[:b, i+1:i+2]
 
-        return curr_sample
+        # Return a copy to avoid buffer being overwritten in next call
+        return curr_sample.clone()
 
     def reset_caches(self):
         self.backbone.reset_caches()
         self.decoder.reset_caches()
+
+    def compile_model(self, mode: str = "reduce-overhead"):
+        """Compile the model with torch.compile for faster inference.
+
+        Args:
+            mode: Compilation mode. "reduce-overhead" uses CUDA graphs for
+                  minimum CPU overhead (best for slow CPUs with fast GPUs).
+                  "default" for general optimization.
+
+        Note: Only supported on Linux with CUDA. Windows users should skip this.
+        """
+        if self._is_compiled:
+            return
+
+        import sys
+        if sys.platform == "win32":
+            print("Warning: torch.compile not fully supported on Windows, skipping")
+            return
+
+        try:
+            self.backbone = torch.compile(self.backbone, mode=mode)
+            self.decoder = torch.compile(self.decoder, mode=mode)
+            self._is_compiled = True
+            print(f"Model compiled with mode='{mode}'")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
 
     def _embed_local_audio(self, tokens):
         """the token from 0-30"""
