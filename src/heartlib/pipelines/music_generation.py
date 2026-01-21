@@ -252,10 +252,20 @@ class HeartMuLaGenPipeline(Pipeline):
 
         max_audio_frames = max_audio_length_ms // 80
 
+        # Async EOS check: check previous frame's result while computing current frame
+        # This pipelines the CPU sync with GPU compute
+        eos_threshold = self.config.audio_eos_id
+        pending_eos_check = None  # Will hold async EOS comparison result
+
         for i in tqdm(range(max_audio_frames)):
             # Check for stop signal
             if stop_check is not None and stop_check():
                 break
+
+            # Check EOS from PREVIOUS iteration (async - computed while GPU was busy)
+            if pending_eos_check is not None and torch.any(pending_eos_check):
+                break
+
             curr_token, curr_token_mask = _pad_audio_token(curr_token)
             with torch.autocast(device_type=self.device.type, dtype=self._dtype):
                 curr_token = self.model.generate_frame(
@@ -269,9 +279,15 @@ class HeartMuLaGenPipeline(Pipeline):
                     starts=None,
                     negative_embedding=negative_embedding,
                 )
-            if torch.any(curr_token[0:1, :] >= self.config.audio_eos_id):
-                break
+
+            # Start async EOS check - GPU computes this while we loop back
+            pending_eos_check = curr_token[0:1, :] >= eos_threshold
+
             frames.append(curr_token[0:1,])
+
+        # Handle case where last frame was EOS (remove it from frames)
+        if pending_eos_check is not None and len(frames) > 0 and torch.any(pending_eos_check):
+            frames.pop()
 
         # Offload HeartMuLa model to CPU to free GPU memory for detokenize
         # This prevents OOM during the detokenize step
