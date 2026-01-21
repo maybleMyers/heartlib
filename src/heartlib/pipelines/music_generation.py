@@ -217,6 +217,7 @@ class HeartMuLaGenPipeline(Pipeline):
             "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
             "negative_tokens": negative_tokens,
             "ref_latent": ref_latent,
+            "ref_audio_path": ref_audio_path if ref_latent is not None else None,
         }
 
     def _forward(
@@ -237,6 +238,7 @@ class HeartMuLaGenPipeline(Pipeline):
         prompt_pos = model_inputs["pos"]
         negative_tokens = model_inputs.get("negative_tokens", None)
         ref_latent = model_inputs.get("ref_latent", None)
+        ref_audio_path = model_inputs.get("ref_audio_path", None)
 
         # Ensure model is on the correct device (may have been offloaded after previous generation)
         # Skip this check when block swapping is active, as some parameters are intentionally on CPU
@@ -364,10 +366,27 @@ class HeartMuLaGenPipeline(Pipeline):
             self.audio_codec.to("cpu")
             torch.cuda.empty_cache()
 
-        return {"wav": wav}
+        return {"wav": wav, "ref_audio_path": ref_audio_path}
 
     def postprocess(self, model_outputs: Dict[str, Any], save_path: str, metadata: Optional[Dict[str, Any]] = None):
         wav = model_outputs["wav"]
+        ref_audio_path = model_outputs.get("ref_audio_path", None)
+
+        # Normalize img2img output to match reference audio loudness
+        if ref_audio_path is not None:
+            ref_wav, ref_sr = torchaudio.load(ref_audio_path)
+            # Resample if needed
+            if ref_sr != 48000:
+                ref_wav = torchaudio.transforms.Resample(ref_sr, 48000)(ref_wav)
+
+            # Compute RMS
+            ref_rms = ref_wav.pow(2).mean().sqrt()
+            out_rms = wav.pow(2).mean().sqrt()
+
+            # Scale output to match reference RMS
+            if out_rms > 0:
+                wav = wav * (ref_rms / out_rms)
+                print(f"[postprocess] Normalized img2img output: ref_rms={ref_rms:.4f}, out_rms={out_rms:.4f}")
 
         # Determine format from extension
         if save_path.lower().endswith('.mp3'):
