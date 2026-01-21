@@ -1,0 +1,40 @@
+# HeartLib Requirements
+# Install with: pip install -r requirements.txt
+#
+# Note: For CUDA support, install PyTorch separately first:
+#   pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu128
+# Then install remaining requirements:
+#   pip install -r requirements.txt
+
+# PyTorch ecosystem
+torch>=2.4.1,<2.9
+torchaudio>=2.4.1
+torchvision>=0.19.1
+torchtune>=0.4.0
+torchao>=0.9.0
+
+# Core ML dependencies
+numpy>=2.0.2
+transformers>=4.57.0
+tokenizers>=0.22.1
+accelerate>=1.12.0
+bitsandbytes>=0.49.0
+einops>=0.8.1
+vector-quantize-pytorch>=1.27.15
+
+# Data handling
+datasets>=3.0.0
+pyarrow>=17.0.0
+
+# Audio processing
+soundfile
+
+# Utilities
+tqdm>=4.67.1
+traitlets>=5.7.1
+traittypes>=0.2.3
+ipykernel>=6.17.1
+modelscope>=1.33.0
+
+# Gradio UI
+gradio>=5.23.1
