@@ -312,6 +312,9 @@ def generate_music(
     seed: int,
     output_folder: str,
     compile_model: bool = False,
+    ref_audio: str = None,
+    ref_strength: float = 0.7,
+    num_steps: int = 10,
 ):
     """Generate music using HeartMuLa with batch support.
 
@@ -344,6 +347,10 @@ def generate_music(
                 pipe.audio_codec.to("cpu")
                 del pipe.audio_codec
             del pipe
+
+        # Reset torch.compile state to free CUDA graph private pools
+        torch._dynamo.reset()
+
         import gc
         for _ in range(3):
             gc.collect()
@@ -379,12 +386,13 @@ def generate_music(
         log(f"Tags: {tags}")
         if negative_prompt.strip():
             log(f"Negative prompt: {negative_prompt}")
+        if ref_audio and os.path.isfile(ref_audio):
+            log(f"Reference audio: {ref_audio} (strength={ref_strength}, steps={num_steps})")
         log(f"Max duration: {max_duration_seconds}s")
         log(f"Temperature: {temperature}, Top-K: {topk}, CFG Scale: {cfg_scale}")
 
         yield (*create_audio_outputs([]), "Loading model...")
 
-        # Load model fresh for this generation
         from heartlib import HeartMuLaGenPipeline
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -512,11 +520,35 @@ def generate_music(
             start_time = time.perf_counter()
 
             with torch.no_grad():
+                inputs = {
+                    "lyrics": lyrics,
+                    "tags": tags,
+                }
+                if ref_audio and os.path.isfile(ref_audio):
+                    inputs["ref_audio"] = ref_audio
+
+                # Build metadata dictionary with all generation settings
+                generation_metadata = {
+                    "lyrics": lyrics,
+                    "tags": tags,
+                    "negative_prompt": negative_prompt if negative_prompt.strip() else "",
+                    "max_duration": max_duration_seconds,
+                    "temperature": temperature,
+                    "topk": topk,
+                    "cfg_scale": cfg_scale,
+                    "model_version": model_version,
+                    "model_path": model_path,
+                    "model_dtype": model_dtype,
+                    "num_gpu_blocks": num_gpu_blocks,
+                    "seed": current_seed,
+                    "ref_strength": ref_strength,
+                    "num_steps": num_steps,
+                    "compile_model": compile_model,
+                    "generated_at": datetime.now().isoformat(),
+                }
+
                 pipe(
-                    {
-                        "lyrics": lyrics,
-                        "tags": tags,
-                    },
+                    inputs,
                     max_audio_length_ms=max_audio_length_ms,
                     save_path=output_path,
                     topk=topk,
@@ -524,6 +556,10 @@ def generate_music(
                     cfg_scale=cfg_scale,
                     negative_prompt=negative_prompt if negative_prompt.strip() else None,
                     stop_check=stop_event.is_set,
+                    ref_audio=ref_audio if ref_audio and os.path.isfile(ref_audio) else None,
+                    ref_strength=ref_strength,
+                    num_steps=num_steps,
+                    metadata=generation_metadata,
                 )
 
             elapsed = time.perf_counter() - start_time
@@ -593,135 +629,192 @@ with gr.Blocks(
     """,
     title="HeartMuLa Music Generator"
 ) as demo:
-
-    gr.Markdown("# HeartMuLa Music Generator")
-    gr.Markdown("AI-powered music generation with lyrics and style tags")
-
-    # Row 1: Main Inputs + Status
-    with gr.Row():
-        # Left column - Lyrics & Tags
-        with gr.Column(scale=3):
-            with gr.Accordion("Lyrics", open=True):
-                with gr.Row():
-                    lyrics_input = gr.Textbox(
-                        label="main lyric prompt",
-                        placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
-                        value=DEFAULT_LYRICS,
-                        lines=12,
-                    )
-            tags_input = gr.Textbox(
-                label="Style Tags",
-                placeholder="piano,happy,romantic",
-                value=DEFAULT_TAGS,
-                info="Comma-separated tags (e.g., piano,happy,romantic)"
-            )
-            negative_prompt_input = gr.Textbox(
-                label="Negative Prompt (Optional)",
-                placeholder="noise,distortion,low quality",
-                value="",
-                info="Comma-separated tags to avoid (e.g., noise,distortion)"
-            )
+    with gr.Tabs():
+        with gr.Tab("Generation"):
+            # Row 1: Main Inputs + Status
             with gr.Row():
-                batch_count = gr.Number(label="Batch Count", value=1, minimum=1, step=1, scale=1)
-                seed = gr.Number(label="Seed (-1 = random)", value=-1, scale=1)
-                random_seed_btn = gr.Button("🎲", scale=0, min_width=40)
-
-        # Right column - Status
-        with gr.Column(scale=1):
-            status_text = gr.Textbox(label="Status", interactive=False, value="Ready", lines=3)
-
-    # Row 2: Buttons
-    with gr.Row():
-        generate_btn = gr.Button("🎵 Generate Music", variant="primary", elem_classes="green-btn")
-        stop_btn = gr.Button("⏹️ Stop", variant="stop")
-        save_defaults_btn = gr.Button("💾 Save Defaults")
-        load_defaults_btn = gr.Button("📂 Load Defaults")
-
-    # Row 3: Parameters + Output
-    with gr.Row():
-        # Left column - Parameters
-        with gr.Column():
-            with gr.Accordion("Model Settings", open=True):
-                model_path = gr.Textbox(
-                    label="Model Path",
-                    value="./ckpt",
-                    info="Path to the HeartMuLa checkpoint directory"
-                )
-                with gr.Row():
-                    model_version = gr.Dropdown(
-                        label="Model Version",
-                        choices=["3B", "7B"],
-                        value="3B",
-                        scale=1
+                # Left column - Lyrics & Tags
+                with gr.Column(scale=3):
+                    with gr.Accordion("Lyrics", open=True):
+                        with gr.Row():
+                            lyrics_input = gr.Textbox(
+                                label="main lyric prompt",
+                                placeholder="[Verse]\nYour lyrics here...\n\n[Chorus]\nChorus lyrics...",
+                                value=DEFAULT_LYRICS,
+                                lines=12,
+                            )
+                    tags_input = gr.Textbox(
+                        label="Style Tags",
+                        placeholder="piano,happy,romantic",
+                        value=DEFAULT_TAGS,
+                        info="Comma-separated tags (e.g., piano,happy,romantic)"
                     )
-                    model_dtype = gr.Dropdown(
-                        label="Precision",
-                        choices=["fp32", "bf16", "fp16"],
-                        value="bf16",
-                        scale=1
+                    negative_prompt_input = gr.Textbox(
+                        label="Negative Prompt (Optional)",
+                        placeholder="noise,distortion,low quality",
+                        value="",
+                        info="Comma-separated tags to avoid (e.g., noise,distortion)"
                     )
-                num_gpu_blocks = gr.Slider(
-                    label="GPU Blocks",
-                    minimum=0,
-                    maximum=28,
-                    value=14,
-                    step=1,
-                    info="Blocks on GPU (0 = all). Lower = less VRAM."
-                )
-                output_folder = gr.Textbox(
-                    label="Output Folder",
-                    value="./output",
-                    info="Directory to save generated music"
-                )
-                compile_checkbox = gr.Checkbox(
-                    label="Compile Model (CUDA Graphs)",
-                    value=False,
-                    info="Faster inference on Linux. First run compiles. Not supported on Windows."
-                )
+                    with gr.Row():
+                        batch_count = gr.Number(label="Batch Count", value=1, minimum=1, step=1, scale=1)
+                        seed = gr.Number(label="Seed (-1 = random)", value=-1, scale=1)
+                        random_seed_btn = gr.Button("🎲", scale=0, min_width=40)
 
-            with gr.Accordion("Generation Parameters", open=True):
-                max_duration = gr.Slider(
-                    label="Max Duration (seconds)",
-                    minimum=10,
-                    maximum=240,
-                    value=120,
-                    step=10
-                )
-                with gr.Row():
-                    temperature = gr.Slider(
-                        label="Temperature",
-                        minimum=0.1,
-                        maximum=2.0,
-                        value=1.0,
-                        step=0.1,
-                        scale=1
-                    )
-                    topk = gr.Slider(
-                        label="Top-K",
-                        minimum=1,
-                        maximum=200,
-                        value=50,
-                        step=1,
-                        scale=1
-                    )
-                cfg_scale = gr.Slider(
-                    label="CFG Scale (Guidance)",
-                    minimum=1.0,
-                    maximum=12.0,
-                    value=1.5,
-                    step=0.1,
-                    info="Higher = stronger adherence to tags/lyrics"
-                )
+                # Right column - Status
+                with gr.Column(scale=1):
+                    status_text = gr.Textbox(label="Status", interactive=False, value="Ready", lines=3)
+                    with gr.Accordion("Reference Audio (img2img)", open=True):
+                        ref_audio_input = gr.Audio(
+                            label="Reference Audio (upload to influence generated sound)",
+                            type="filepath",
+                        )
+                        ref_strength_slider = gr.Slider(
+                            label="Strength (1.0 = ignore reference, 0.0 = pure reference)",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.7,
+                            step=0.01,
+                        )
+                        num_steps_slider = gr.Slider(
+                            label="Diffusion Steps (more = higher quality, slower)",
+                            minimum=1,
+                            maximum=50,
+                            value=10,
+                            step=1,
+                        )
 
-        # Right column - Output
-        with gr.Column():
-            audio_outputs = []
-            for i in range(MAX_AUDIO_OUTPUTS):
-                audio_outputs.append(gr.Audio(
-                    label=f"Song {i+1}",
-                    visible=False,
-                    interactive=False
-                ))
+            # Row 2: Buttons
+            with gr.Row():
+                generate_btn = gr.Button("🎵 Generate Music", variant="primary", elem_classes="green-btn")
+                stop_btn = gr.Button("⏹️ Stop", variant="stop")
+                save_defaults_btn = gr.Button("💾 Save Defaults")
+                load_defaults_btn = gr.Button("📂 Load Defaults")
+
+            # Row 3: Parameters + Output
+            with gr.Row():
+                # Left column - Parameters
+                with gr.Column():
+                    with gr.Accordion("Model Settings", open=True):
+                        with gr.Row():
+                            model_path = gr.Textbox(
+                                label="Model Path",
+                                value="./ckpt",
+                                info="Path to the HeartMuLa checkpoint directory"
+                            )
+                            model_version = gr.Dropdown(
+                                label="Model Version",
+                                choices=["3B", "7B"],
+                                value="3B",
+                                scale=1
+                            )
+                            model_dtype = gr.Dropdown(
+                                label="Precision",
+                                choices=["fp32", "bf16", "fp16"],
+                                value="bf16",
+                                scale=1
+                            )
+                        num_gpu_blocks = gr.Slider(
+                            label="GPU Blocks",
+                            minimum=0,
+                            maximum=28,
+                            value=14,
+                            step=1,
+                            info="Blocks on GPU (0 = all). Lower = less VRAM."
+                        )
+                        with gr.Row():
+                            output_folder = gr.Textbox(
+                                label="Output Folder",
+                                value="./output",
+                                info="Directory to save generated music"
+                            )
+                            compile_checkbox = gr.Checkbox(
+                                label="Compile Model (CUDA Graphs)",
+                                value=False,
+                                info="Faster inference on Linux. First run compiles. Not supported on Windows."
+                            )
+
+                    with gr.Accordion("Generation Parameters", open=True):
+                        max_duration = gr.Slider(
+                            label="Max Duration (seconds)",
+                            minimum=10,
+                            maximum=240,
+                            value=120,
+                            step=10
+                        )
+                        with gr.Row():
+                            temperature = gr.Slider(
+                                label="Temperature",
+                                minimum=0.1,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                scale=1
+                            )
+                            topk = gr.Slider(
+                                label="Top-K",
+                                minimum=1,
+                                maximum=200,
+                                value=50,
+                                step=1,
+                                scale=1
+                            )
+                        cfg_scale = gr.Slider(
+                            label="CFG Scale (Guidance)",
+                            minimum=1.0,
+                            maximum=12.0,
+                            value=1.5,
+                            step=0.1,
+                            info="Higher = stronger adherence to tags/lyrics"
+                        )
+
+                # Right column - Output
+                with gr.Column():
+                    audio_outputs = []
+                    for i in range(MAX_AUDIO_OUTPUTS):
+                        audio_outputs.append(gr.Audio(
+                            label=f"Song {i+1}",
+                            visible=False,
+                            interactive=False
+                        ))
+
+        # Audio Info Tab
+        with gr.Tab("Audio Info"):
+            gr.Markdown("### Load Settings from MP3")
+            gr.Markdown("Upload a HeartMuLa-generated MP3 to view and load its generation settings.")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    audio_info_input = gr.Audio(
+                        label="Upload MP3 File",
+                        type="filepath",
+                    )
+                    load_settings_btn = gr.Button("📥 Load Settings to Generation Tab", variant="primary")
+                    audio_info_status = gr.Textbox(label="Status", interactive=False, value="", lines=2)
+
+                with gr.Column(scale=2):
+                    with gr.Accordion("Metadata Preview", open=True):
+                        info_lyrics = gr.Textbox(label="Lyrics", lines=8, interactive=False)
+                        info_tags = gr.Textbox(label="Tags", interactive=False)
+                        info_negative_prompt = gr.Textbox(label="Negative Prompt", interactive=False)
+
+                    with gr.Accordion("Generation Parameters", open=True):
+                        with gr.Row():
+                            info_seed = gr.Textbox(label="Seed", interactive=False)
+                            info_max_duration = gr.Textbox(label="Max Duration (s)", interactive=False)
+                            info_temperature = gr.Textbox(label="Temperature", interactive=False)
+                        with gr.Row():
+                            info_topk = gr.Textbox(label="Top-K", interactive=False)
+                            info_cfg_scale = gr.Textbox(label="CFG Scale", interactive=False)
+                            info_ref_strength = gr.Textbox(label="Ref Strength", interactive=False)
+
+                    with gr.Accordion("Model Settings", open=True):
+                        with gr.Row():
+                            info_model_version = gr.Textbox(label="Model Version", interactive=False)
+                            info_model_dtype = gr.Textbox(label="Precision", interactive=False)
+                            info_num_gpu_blocks = gr.Textbox(label="GPU Blocks", interactive=False)
+                        with gr.Row():
+                            info_model_path = gr.Textbox(label="Model Path", interactive=False)
+                            info_generated_at = gr.Textbox(label="Generated At", interactive=False)
 
     # Event handlers
     def update_blocks_slider(version):
@@ -729,7 +822,7 @@ with gr.Blocks(
         return gr.update(maximum=max_blocks, info=f"Blocks on GPU (0 = all). {version} has {max_blocks} blocks.")
 
     def randomize_seed():
-        return random.randint(0, 2**32 - 1)
+        return -1
 
     model_version.change(
         fn=update_blocks_slider,
@@ -746,7 +839,8 @@ with gr.Blocks(
         fn=generate_music,
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
-                batch_count, seed, output_folder, compile_checkbox],
+                batch_count, seed, output_folder, compile_checkbox,
+                ref_audio_input, ref_strength_slider, num_steps_slider],
         outputs=audio_outputs + [status_text]
     )
 
@@ -760,14 +854,16 @@ with gr.Blocks(
     defaults_components = [
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        max_duration, temperature, topk, cfg_scale, compile_checkbox
+        max_duration, temperature, topk, cfg_scale, compile_checkbox,
+        ref_strength_slider, num_steps_slider
     ]
 
     # Keys for the defaults file (must match order of components)
     defaults_keys = [
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
-        "max_duration", "temperature", "topk", "cfg_scale", "compile_model"
+        "max_duration", "temperature", "topk", "cfg_scale", "compile_model",
+        "ref_strength", "num_steps"
     ]
 
     def save_defaults(*values):
@@ -815,6 +911,126 @@ with gr.Blocks(
         fn=load_defaults,
         inputs=None,
         outputs=defaults_components + [status_text]
+    )
+
+    # Audio Info Tab event handlers
+    # Store loaded metadata in a state variable
+    loaded_metadata_state = gr.State(value=None)
+
+    def load_mp3_metadata(audio_path):
+        """Load and display metadata from an MP3 file."""
+        if audio_path is None:
+            return (
+                None,  # metadata state
+                "",    # status
+                "",    # lyrics
+                "",    # tags
+                "",    # negative_prompt
+                "",    # seed
+                "",    # max_duration
+                "",    # temperature
+                "",    # topk
+                "",    # cfg_scale
+                "",    # ref_strength
+                "",    # model_version
+                "",    # model_dtype
+                "",    # num_gpu_blocks
+                "",    # model_path
+                "",    # generated_at
+            )
+
+        if not audio_path.lower().endswith('.mp3'):
+            return (
+                None,
+                "Please upload an MP3 file.",
+                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+            )
+
+        try:
+            from heartlib import HeartMuLaGenPipeline
+            metadata = HeartMuLaGenPipeline.read_mp3_metadata(audio_path)
+
+            if metadata is None:
+                return (
+                    None,
+                    "No HeartMuLa metadata found in this MP3.",
+                    "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+                )
+
+            return (
+                metadata,  # state
+                "Metadata loaded successfully!",
+                metadata.get("lyrics", ""),
+                metadata.get("tags", ""),
+                metadata.get("negative_prompt", ""),
+                str(metadata.get("seed", "")),
+                str(metadata.get("max_duration", "")),
+                str(metadata.get("temperature", "")),
+                str(metadata.get("topk", "")),
+                str(metadata.get("cfg_scale", "")),
+                str(metadata.get("ref_strength", "")),
+                metadata.get("model_version", ""),
+                metadata.get("model_dtype", ""),
+                str(metadata.get("num_gpu_blocks", "")),
+                metadata.get("model_path", ""),
+                metadata.get("generated_at", ""),
+            )
+        except Exception as e:
+            return (
+                None,
+                f"Error reading metadata: {e}",
+                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+            )
+
+    def send_settings_to_generation(metadata):
+        """Send loaded metadata settings to the generation tab."""
+        if metadata is None:
+            return [gr.update()] * 16 + ["No metadata loaded. Please upload an MP3 first."]
+
+        # Map metadata to generation tab components
+        # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
+        # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
+        # max_duration, temperature, topk, cfg_scale, compile_model, ref_strength
+        updates = [
+            gr.update(value=metadata.get("lyrics", "")),
+            gr.update(value=metadata.get("tags", "")),
+            gr.update(value=metadata.get("negative_prompt", "")),
+            gr.update(value=1),  # batch_count - reset to 1
+            gr.update(value=metadata.get("seed", -1)),
+            gr.update(value=metadata.get("model_path", "./ckpt")),
+            gr.update(value=metadata.get("model_version", "3B")),
+            gr.update(value=metadata.get("model_dtype", "bf16")),
+            gr.update(value=metadata.get("num_gpu_blocks", 14)),
+            gr.update(),  # output_folder - keep current
+            gr.update(value=metadata.get("max_duration", 120)),
+            gr.update(value=metadata.get("temperature", 1.0)),
+            gr.update(value=metadata.get("topk", 50)),
+            gr.update(value=metadata.get("cfg_scale", 1.5)),
+            gr.update(value=metadata.get("compile_model", False)),
+            gr.update(value=metadata.get("ref_strength", 0.7)),
+        ]
+
+        return updates + ["Settings loaded to Generation tab!"]
+
+    # Info display components for Audio Info tab
+    info_display_components = [
+        info_lyrics, info_tags, info_negative_prompt,
+        info_seed, info_max_duration, info_temperature,
+        info_topk, info_cfg_scale, info_ref_strength,
+        info_model_version, info_model_dtype, info_num_gpu_blocks,
+        info_model_path, info_generated_at
+    ]
+
+    audio_info_input.change(
+        fn=load_mp3_metadata,
+        inputs=[audio_info_input],
+        outputs=[loaded_metadata_state, audio_info_status] + info_display_components
+    )
+
+    load_settings_btn.click(
+        fn=send_settings_to_generation,
+        inputs=[loaded_metadata_state],
+        outputs=defaults_components + [audio_info_status]
     )
 
     # Auto-load defaults on startup

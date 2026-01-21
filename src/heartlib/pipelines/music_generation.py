@@ -11,6 +11,9 @@ import torchaudio
 import json
 from transformers import BitsAndBytesConfig
 
+# Metadata constants for MP3 ID3 tags
+HEARTMULA_METADATA_PREFIX = "HEARTMULA_"
+
 
 @dataclass
 class HeartMuLaGenConfig:
@@ -74,6 +77,8 @@ class HeartMuLaGenPipeline(Pipeline):
         preprocess_kwargs = {
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
             "negative_prompt": kwargs.get("negative_prompt", None),
+            "ref_audio": kwargs.get("ref_audio", None),
+            "ref_strength": kwargs.get("ref_strength", 0.7),
         }
         forward_kwargs = {
             "max_audio_length_ms": kwargs.get("max_audio_length_ms", 120_000),
@@ -81,13 +86,33 @@ class HeartMuLaGenPipeline(Pipeline):
             "topk": kwargs.get("topk", 50),
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
             "stop_check": kwargs.get("stop_check", None),
+            "ref_strength": kwargs.get("ref_strength", 0.7),
+            "num_steps": kwargs.get("num_steps", 10),
         }
         postprocess_kwargs = {
             "save_path": kwargs.get("save_path", "output.mp3"),
+            "metadata": kwargs.get("metadata", None),
         }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
-    def preprocess(self, inputs: Dict[str, Any], cfg_scale: float, negative_prompt: str = None):
+    def __call__(self, inputs, **kwargs):
+        """Custom __call__ to ensure proper kwargs passing to all stages."""
+        preprocess_kwargs, forward_kwargs, postprocess_kwargs = self._sanitize_parameters(**kwargs)
+
+        model_inputs = self.preprocess(inputs, **preprocess_kwargs)
+        model_outputs = self._forward(model_inputs, **forward_kwargs)
+        self.postprocess(model_outputs, **postprocess_kwargs)
+
+        return model_outputs
+
+    def preprocess(
+        self,
+        inputs: Dict[str, Any],
+        cfg_scale: float,
+        negative_prompt: str = None,
+        ref_audio: str = None,
+        ref_strength: float = 0.7,
+    ):
 
         # process tags
         tags = inputs["tags"]
@@ -109,10 +134,28 @@ class HeartMuLaGenPipeline(Pipeline):
         if tags_ids[-1] != self.config.text_eos_id:
             tags_ids = tags_ids + [self.config.text_eos_id]
 
-        # process reference audio
-        ref_audio = inputs.get("ref_audio", None)
-        if ref_audio is not None:
-            raise NotImplementedError("ref_audio is not supported yet.")
+        # process reference audio for img2img-style generation
+        ref_audio_path = inputs.get("ref_audio", ref_audio)
+        ref_latent = None
+
+        if ref_audio_path is not None and os.path.isfile(ref_audio_path):
+            # Move audio_codec to GPU for tokenization if it's on CPU
+            codec_was_on_cpu = next(self.audio_codec.parameters()).device.type == "cpu"
+            if codec_was_on_cpu:
+                self.audio_codec.to(self.device)
+
+            # Encode reference audio to latent
+            ref_latent = self.audio_codec.tokenize(ref_audio_path, device=self.device)
+            # Move to CPU to free GPU memory during HeartMuLa generation
+            ref_latent = ref_latent.cpu()
+
+            # Move audio_codec back to CPU if it was originally there
+            if codec_was_on_cpu:
+                self.audio_codec.to("cpu")
+                torch.cuda.empty_cache()
+
+            print(f"[img2img] Encoded reference audio: {ref_latent.shape}, strength={ref_strength}")
+
         muq_embed = torch.zeros([self._muq_dim], dtype=self._dtype)
         muq_idx = len(tags_ids)
 
@@ -173,6 +216,7 @@ class HeartMuLaGenPipeline(Pipeline):
             "muq_idx": [muq_idx] * bs_size,
             "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
             "negative_tokens": negative_tokens,
+            "ref_latent": ref_latent,
         }
 
     def _forward(
@@ -183,6 +227,8 @@ class HeartMuLaGenPipeline(Pipeline):
         topk: int,
         cfg_scale: float,
         stop_check: callable = None,
+        ref_strength: float = 0.7,
+        num_steps: int = 10,
     ):
         prompt_tokens = model_inputs["tokens"]
         prompt_tokens_mask = model_inputs["tokens_mask"]
@@ -190,6 +236,7 @@ class HeartMuLaGenPipeline(Pipeline):
         starts = model_inputs["muq_idx"]
         prompt_pos = model_inputs["pos"]
         negative_tokens = model_inputs.get("negative_tokens", None)
+        ref_latent = model_inputs.get("ref_latent", None)
 
         # Ensure model is on the correct device (may have been offloaded after previous generation)
         # Skip this check when block swapping is active, as some parameters are intentionally on CPU
@@ -300,7 +347,17 @@ class HeartMuLaGenPipeline(Pipeline):
             self.audio_codec.to(self.device)
 
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
-        wav = self.audio_codec.detokenize(frames)
+
+        # Move ref_latent to GPU if provided
+        if ref_latent is not None:
+            ref_latent = ref_latent.to(self.device)
+
+        wav = self.audio_codec.detokenize(
+            frames,
+            ref_latent=ref_latent,
+            ref_strength=ref_strength,
+            num_steps=num_steps,
+        )
 
         # Move audio_codec back to CPU if it was originally there
         if codec_was_on_cpu:
@@ -309,9 +366,116 @@ class HeartMuLaGenPipeline(Pipeline):
 
         return {"wav": wav}
 
-    def postprocess(self, model_outputs: Dict[str, Any], save_path: str):
+    def postprocess(self, model_outputs: Dict[str, Any], save_path: str, metadata: Optional[Dict[str, Any]] = None):
         wav = model_outputs["wav"]
-        torchaudio.save(save_path, wav, 48000)
+
+        # Determine format from extension
+        if save_path.lower().endswith('.mp3'):
+            torchaudio.save(save_path, wav, 48000, format="mp3")
+        else:
+            torchaudio.save(save_path, wav, 48000)
+
+        # Write metadata to MP3 if provided
+        if metadata is not None and save_path.lower().endswith('.mp3'):
+            self._write_mp3_metadata(save_path, metadata)
+            print(f"[metadata] Saved metadata to {save_path}")
+
+    def _write_mp3_metadata(self, save_path: str, metadata: Dict[str, Any]):
+        """Write generation metadata to MP3 ID3 tags."""
+        try:
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import ID3, TXXX, COMM, TIT2, error as ID3Error
+
+            # Load or create ID3 tags
+            try:
+                audio = MP3(save_path)
+                if audio.tags is None:
+                    audio.add_tags()
+            except ID3Error:
+                audio = MP3(save_path)
+                audio.add_tags()
+
+            # Set title if we have tags
+            if "tags" in metadata:
+                audio.tags.add(TIT2(encoding=3, text=f"HeartMuLa: {metadata['tags'][:50]}"))
+
+            # Store each metadata field as a TXXX frame
+            for key, value in metadata.items():
+                frame_desc = f"{HEARTMULA_METADATA_PREFIX}{key}"
+                # Convert value to string for storage
+                if isinstance(value, (dict, list)):
+                    str_value = json.dumps(value)
+                else:
+                    str_value = str(value)
+                audio.tags.add(TXXX(encoding=3, desc=frame_desc, text=str_value))
+
+            # Also store complete metadata as JSON in a comment for easy parsing
+            audio.tags.add(COMM(
+                encoding=3,
+                lang='eng',
+                desc='HEARTMULA_JSON',
+                text=json.dumps(metadata)
+            ))
+
+            audio.save()
+        except ImportError:
+            print("Warning: mutagen not installed. Metadata will not be saved to MP3.")
+        except Exception as e:
+            print(f"Warning: Failed to write metadata to MP3: {e}")
+
+    @staticmethod
+    def read_mp3_metadata(file_path: str) -> Optional[Dict[str, Any]]:
+        """Read HeartMuLa generation metadata from an MP3 file.
+
+        Returns:
+            Dictionary of metadata if found, None otherwise.
+        """
+        try:
+            from mutagen.mp3 import MP3
+            from mutagen.id3 import ID3
+
+            audio = MP3(file_path)
+            if audio.tags is None:
+                return None
+
+            # First try to get the JSON comment (easiest)
+            for key in audio.tags.keys():
+                if key.startswith('COMM') and 'HEARTMULA_JSON' in str(audio.tags[key]):
+                    frame = audio.tags[key]
+                    try:
+                        return json.loads(frame.text[0] if isinstance(frame.text, list) else frame.text)
+                    except (json.JSONDecodeError, IndexError):
+                        pass
+
+            # Fallback: reconstruct from TXXX frames
+            metadata = {}
+            for key in audio.tags.keys():
+                if key.startswith('TXXX'):
+                    frame = audio.tags[key]
+                    if frame.desc.startswith(HEARTMULA_METADATA_PREFIX):
+                        field_name = frame.desc[len(HEARTMULA_METADATA_PREFIX):]
+                        value = frame.text[0] if isinstance(frame.text, list) else frame.text
+                        # Try to parse as JSON for complex types
+                        try:
+                            metadata[field_name] = json.loads(value)
+                        except json.JSONDecodeError:
+                            # Try to convert numeric strings
+                            try:
+                                if '.' in value:
+                                    metadata[field_name] = float(value)
+                                else:
+                                    metadata[field_name] = int(value)
+                            except ValueError:
+                                metadata[field_name] = value
+
+            return metadata if metadata else None
+
+        except ImportError:
+            print("Warning: mutagen not installed. Cannot read MP3 metadata.")
+            return None
+        except Exception as e:
+            print(f"Warning: Failed to read metadata from MP3: {e}")
+            return None
 
     @classmethod
     def from_pretrained(

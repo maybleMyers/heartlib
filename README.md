@@ -29,7 +29,9 @@ cd heartlib
 uv sync
 uv run heart1.py
 ```
-
+  
+I have also provided a requirements.txt file if you would prefer to install via pip. Create a venv, then Install torch, torchvision and torchaudio before running pip install -r requirements.txt  
+  
 Download the pretrained checkpoints from huggingface or modelscope using the following command:
 
 ```

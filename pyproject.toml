@@ -32,6 +32,7 @@ dependencies = [
     "pyarrow>=17.0.0",
     # Audio processing
     "soundfile",
+    "mutagen>=1.47.0",
     # Utilities
     "tqdm>=4.67.1",
     "traitlets>=5.7.1",
