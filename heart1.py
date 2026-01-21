@@ -32,6 +32,9 @@ MODEL_LAYER_COUNTS = {
 # Global stop event for batch cancellation
 stop_event = threading.Event()
 
+# Track if CUDA graphs were used (they can't be safely reused after model reload)
+_cuda_graphs_used = False
+
 
 def stop_generation():
     """Signal to stop the current generation."""
@@ -349,7 +352,16 @@ def generate_music(
             del pipe
 
         # Reset torch.compile state to free CUDA graph private pools
-        torch._dynamo.reset()
+        # Wrap in try/except because reset can fail if TLS state is already corrupted
+        try:
+            torch._dynamo.reset()
+        except (AssertionError, RuntimeError) as e:
+            log(f"Warning: torch._dynamo.reset() failed: {e}")
+            # Force clear dynamo caches without touching CUDA graphs
+            try:
+                torch._dynamo.reset_code_caches()
+            except Exception:
+                pass
 
         import gc
         for _ in range(3):
@@ -473,9 +485,25 @@ def generate_music(
             log(f"GPU Memory after model load: {allocated:.2f}GB")
 
         # Optionally compile model for faster inference (reduces CPU overhead)
+        global _cuda_graphs_used
         if compile_model:
-            log("Compiling model with CUDA graphs (first run will be slower)...")
-            pipe.model.compile_model(mode="reduce-overhead")
+            if _cuda_graphs_used:
+                log("Warning: CUDA graphs were used in a previous run. Skipping compilation to avoid state corruption.")
+                log("  (Restart the application to use CUDA graphs again)")
+                compile_model = False
+            else:
+                # Reset any stale CUDA graph state before compiling
+                try:
+                    torch._dynamo.reset()
+                except (AssertionError, RuntimeError):
+                    pass  # Ignore if already clean or in inconsistent state
+                try:
+                    log("Compiling model with CUDA graphs (first run will be slower)...")
+                    pipe.model.compile_model(mode="reduce-overhead")
+                    _cuda_graphs_used = True  # Mark that CUDA graphs are now active
+                except (AssertionError, RuntimeError) as e:
+                    log(f"Warning: CUDA graph compilation failed ({e}), running without compilation")
+                    compile_model = False  # Disable for this run
 
         # Convert duration from seconds to milliseconds
         max_audio_length_ms = int(max_duration_seconds * 1000)
@@ -547,20 +575,29 @@ def generate_music(
                     "generated_at": datetime.now().isoformat(),
                 }
 
-                pipe(
-                    inputs,
-                    max_audio_length_ms=max_audio_length_ms,
-                    save_path=output_path,
-                    topk=topk,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    negative_prompt=negative_prompt if negative_prompt.strip() else None,
-                    stop_check=stop_event.is_set,
-                    ref_audio=ref_audio if ref_audio and os.path.isfile(ref_audio) else None,
-                    ref_strength=ref_strength,
-                    num_steps=num_steps,
-                    metadata=generation_metadata,
-                )
+                try:
+                    pipe(
+                        inputs,
+                        max_audio_length_ms=max_audio_length_ms,
+                        save_path=output_path,
+                        topk=topk,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        negative_prompt=negative_prompt if negative_prompt.strip() else None,
+                        stop_check=stop_event.is_set,
+                        ref_audio=ref_audio if ref_audio and os.path.isfile(ref_audio) else None,
+                        ref_strength=ref_strength,
+                        num_steps=num_steps,
+                        metadata=generation_metadata,
+                    )
+                except AssertionError as e:
+                    if "is_key_in_tls" in str(e) or "tree_manager" in str(e):
+                        raise RuntimeError(
+                            "CUDA graph state corrupted. This happens when running multiple generations "
+                            "with 'Compile Model' enabled. Please disable 'Compile Model (CUDA Graphs)' "
+                            "in the Model Settings, or restart the application."
+                        ) from e
+                    raise
 
             elapsed = time.perf_counter() - start_time
             log(f"Song {i+1} complete! ({elapsed:.1f}s)")
