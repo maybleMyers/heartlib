@@ -251,20 +251,14 @@ class HeartMuLaGenPipeline(Pipeline):
             return padded_token, padded_token_mask
 
         max_audio_frames = max_audio_length_ms // 80
-
-        # Async EOS check: check previous frame's result while computing current frame
-        # This pipelines the CPU sync with GPU compute
+        eos_check_interval = 10  # Only sync every N frames to reduce CPU-GPU sync overhead
         eos_threshold = self.config.audio_eos_id
-        pending_eos_check = None  # Will hold async EOS comparison result
 
         for i in tqdm(range(max_audio_frames)):
-            # Check for stop signal
-            if stop_check is not None and stop_check():
-                break
-
-            # Check EOS from PREVIOUS iteration (async - computed while GPU was busy)
-            if pending_eos_check is not None and torch.any(pending_eos_check):
-                break
+            # Check for stop signal (infrequent, same interval as EOS)
+            if i % eos_check_interval == 0:
+                if stop_check is not None and stop_check():
+                    break
 
             curr_token, curr_token_mask = _pad_audio_token(curr_token)
             with torch.autocast(device_type=self.device.type, dtype=self._dtype):
@@ -280,14 +274,19 @@ class HeartMuLaGenPipeline(Pipeline):
                     negative_embedding=negative_embedding,
                 )
 
-            # Start async EOS check - GPU computes this while we loop back
-            pending_eos_check = curr_token[0:1, :] >= eos_threshold
-
             frames.append(curr_token[0:1,])
 
-        # Handle case where last frame was EOS (remove it from frames)
-        if pending_eos_check is not None and len(frames) > 0 and torch.any(pending_eos_check):
-            frames.pop()
+            # Check EOS every N frames to reduce sync overhead
+            if i % eos_check_interval == 0 and torch.any(curr_token[0:1, :] >= eos_threshold):
+                break
+
+        # Trim any frames after EOS token (in case we overshot by up to eos_check_interval frames)
+        if len(frames) > 0:
+            frames_tensor = torch.stack(frames, dim=0)  # [num_frames, 1, num_codebooks]
+            eos_mask = (frames_tensor[:, 0, :] >= eos_threshold).any(dim=-1)
+            if eos_mask.any():
+                first_eos = eos_mask.nonzero(as_tuple=True)[0][0].item()
+                frames = frames[:first_eos]
 
         # Offload HeartMuLa model to CPU to free GPU memory for detokenize
         # This prevents OOM during the detokenize step
