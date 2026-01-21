@@ -311,6 +311,7 @@ def generate_music(
     batch_count: int,
     seed: int,
     output_folder: str,
+    compile_model: bool = False,
 ):
     """Generate music using HeartMuLa with batch support.
 
@@ -462,6 +463,11 @@ def generate_music(
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             log(f"GPU Memory after model load: {allocated:.2f}GB")
+
+        # Optionally compile model for faster inference (reduces CPU overhead)
+        if compile_model:
+            log("Compiling model with CUDA graphs (first run will be slower)...")
+            pipe.model.compile_model(mode="reduce-overhead")
 
         # Convert duration from seconds to milliseconds
         max_audio_length_ms = int(max_duration_seconds * 1000)
@@ -667,6 +673,11 @@ with gr.Blocks(
                     value="./output",
                     info="Directory to save generated music"
                 )
+                compile_checkbox = gr.Checkbox(
+                    label="Compile Model (CUDA Graphs)",
+                    value=False,
+                    info="Faster inference on Linux. First run compiles. Not supported on Windows."
+                )
 
             with gr.Accordion("Generation Parameters", open=True):
                 max_duration = gr.Slider(
@@ -735,7 +746,7 @@ with gr.Blocks(
         fn=generate_music,
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
-                batch_count, seed, output_folder],
+                batch_count, seed, output_folder, compile_checkbox],
         outputs=audio_outputs + [status_text]
     )
 
@@ -749,14 +760,14 @@ with gr.Blocks(
     defaults_components = [
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        max_duration, temperature, topk, cfg_scale
+        max_duration, temperature, topk, cfg_scale, compile_checkbox
     ]
 
     # Keys for the defaults file (must match order of components)
     defaults_keys = [
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
-        "max_duration", "temperature", "topk", "cfg_scale"
+        "max_duration", "temperature", "topk", "cfg_scale", "compile_model"
     ]
 
     def save_defaults(*values):

@@ -118,6 +118,7 @@ def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
 
 class HeartMuLa(PreTrainedModel):
     config_class = HeartMuLaConfig
+    _is_compiled = False
 
     def __init__(
         self,
@@ -334,6 +335,32 @@ class HeartMuLa(PreTrainedModel):
     def reset_caches(self):
         self.backbone.reset_caches()
         self.decoder.reset_caches()
+
+    def compile_model(self, mode: str = "reduce-overhead"):
+        """Compile the model with torch.compile for faster inference.
+
+        Args:
+            mode: Compilation mode. "reduce-overhead" uses CUDA graphs for
+                  minimum CPU overhead (best for slow CPUs with fast GPUs).
+                  "default" for general optimization.
+
+        Note: Only supported on Linux with CUDA. Windows users should skip this.
+        """
+        if self._is_compiled:
+            return
+
+        import sys
+        if sys.platform == "win32":
+            print("Warning: torch.compile not fully supported on Windows, skipping")
+            return
+
+        try:
+            self.backbone = torch.compile(self.backbone, mode=mode)
+            self.decoder = torch.compile(self.decoder, mode=mode)
+            self._is_compiled = True
+            print(f"Model compiled with mode='{mode}'")
+        except Exception as e:
+            print(f"Warning: torch.compile failed: {e}")
 
     def _embed_local_audio(self, tokens):
         """the token from 0-30"""

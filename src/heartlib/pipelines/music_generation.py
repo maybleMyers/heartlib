@@ -322,6 +322,7 @@ class HeartMuLaGenPipeline(Pipeline):
         version: str,
         bnb_config: Optional[BitsAndBytesConfig] = None,
         skip_model_move: bool = False,
+        compile_model: bool = False,
     ):
 
         if os.path.exists(
@@ -363,5 +364,9 @@ class HeartMuLaGenPipeline(Pipeline):
             raise FileNotFoundError(
                 f"Expected to find gen_config.json for HeartMuLa at {gen_config_path} but not found. Please check your folder {pretrained_path}."
             )
+
+        # Optionally compile model for faster inference (Linux only)
+        if compile_model:
+            heartmula.compile_model(mode="reduce-overhead")
 
         return cls(heartmula, heartcodec, None, tokenizer, gen_config, device, dtype, skip_model_move)
