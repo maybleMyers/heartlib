@@ -95,6 +95,8 @@ class HeartMuLaGenPipeline(Pipeline):
         preprocess_kwargs = {
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
             "negative_prompt": kwargs.get("negative_prompt", None),
+            "ref_audio": kwargs.get("ref_audio", None),  # For img2img latent conditioning
+            "ref_strength": kwargs.get("ref_strength", 0.7),
         }
         forward_kwargs = {
             "max_audio_length_ms": kwargs.get("max_audio_length_ms", 120_000),
@@ -102,6 +104,7 @@ class HeartMuLaGenPipeline(Pipeline):
             "topk": kwargs.get("topk", 50),
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
             "num_steps": kwargs.get("num_steps", 10),
+            "ref_strength": kwargs.get("ref_strength", 0.7),
         }
         postprocess_kwargs = {
             "save_path": kwargs.get("save_path", "output.mp3"),
@@ -113,6 +116,8 @@ class HeartMuLaGenPipeline(Pipeline):
     def preprocess(self, input_: Dict[str, Any], **preprocess_parameters: Any):
         cfg_scale: float = preprocess_parameters.get("cfg_scale", 1.5)
         negative_prompt: Optional[str] = preprocess_parameters.get("negative_prompt", None)
+        ref_audio_kwarg: Optional[str] = preprocess_parameters.get("ref_audio", None)
+        ref_strength: float = preprocess_parameters.get("ref_strength", 0.7)
 
         tags = input_["tags"]
         if os.path.isfile(tags):
@@ -272,14 +277,38 @@ class HeartMuLaGenPipeline(Pipeline):
             emb = emb / (emb.norm(p=2) + 1e-12)
             return emb.to(device="cpu", dtype=self.dtype)
 
-        ref_audio = input_.get("ref_audio", None)
-        if ref_audio is not None:
-            wav, sr = _load_ref_audio(ref_audio)
+        # Semantic reference audio for MuQ-MuLan (from input dict)
+        ref_audio_semantic = input_.get("ref_audio", None)
+        # img2img reference audio for latent conditioning (from kwargs, separate from semantic)
+        ref_audio_img2img = ref_audio_kwarg
+        ref_latent = None
+        ref_audio_path = None
+
+        # Process semantic reference for MuQ-MuLan embedding
+        if ref_audio_semantic is not None and self.muq_mulan is not None:
+            wav, sr = _load_ref_audio(ref_audio_semantic)
             muq_sr = int(input_.get("muq_sample_rate", 24_000))
             audio_bt = _prepare_muq_audio(wav, sr)
             muq_embed = _run_muq_mulan(audio_bt, sample_rate=muq_sr)
+
+            # Offload MuQ-MuLan to CPU after use to free GPU memory
+            if hasattr(self.muq_mulan, 'to'):
+                self.muq_mulan.to("cpu")
+            torch.cuda.empty_cache()
         else:
             muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
+
+        # Process img2img reference for latent conditioning (separate from semantic)
+        if ref_audio_img2img is not None and isinstance(ref_audio_img2img, str) and os.path.isfile(ref_audio_img2img) and ref_strength < 1.0:
+            ref_audio_path = ref_audio_img2img
+
+            # Ensure audio_codec is on CPU for tokenization to avoid OOM
+            # (HeartMuLa model may be using most GPU memory)
+            self.audio_codec.to("cpu")
+
+            # Encode reference audio to latent on CPU
+            ref_latent = self.audio_codec.tokenize(ref_audio_path, device="cpu")
+            # Keep on CPU - will be moved to GPU in _forward when needed
 
         # The reserved slot is the blank "+1" token after tags_ids.
         muq_idx = len(tags_ids)
@@ -338,6 +367,8 @@ class HeartMuLaGenPipeline(Pipeline):
             "muq_idx": [muq_idx] * bs_size,
             "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
             "negative_tokens": negative_tokens,
+            "ref_latent": ref_latent,
+            "ref_audio_path": ref_audio_path,
         }
 
     def _forward(
@@ -352,6 +383,7 @@ class HeartMuLaGenPipeline(Pipeline):
         topk: int = forward_parameters.get("topk", 50)
         cfg_scale: float = forward_parameters.get("cfg_scale", 1.5)
         num_steps: int = forward_parameters.get("num_steps", 10)
+        ref_strength: float = forward_parameters.get("ref_strength", 0.7)
 
         prompt_tokens = input_tensors["tokens"]
         prompt_tokens_mask = input_tensors["tokens_mask"]
@@ -359,6 +391,8 @@ class HeartMuLaGenPipeline(Pipeline):
         starts = input_tensors["muq_idx"]
         prompt_pos = input_tensors["pos"]
         negative_tokens = input_tensors.get("negative_tokens", None)
+        ref_latent = input_tensors.get("ref_latent", None)
+        ref_audio_path = input_tensors.get("ref_audio_path", None)
 
         # Ensure model is on the correct device (may have been offloaded after previous generation)
         # Skip this check when block swapping is active, as some parameters are intentionally on CPU
@@ -471,7 +505,16 @@ class HeartMuLaGenPipeline(Pipeline):
         # Move audio_codec to GPU for detokenization
         self.audio_codec.to(self._device)
 
-        wav = self.audio_codec.detokenize(frames, num_steps=num_steps)
+        # Move ref_latent to GPU if provided
+        if ref_latent is not None:
+            ref_latent = ref_latent.to(self._device)
+
+        wav = self.audio_codec.detokenize(
+            frames,
+            num_steps=num_steps,
+            ref_latent=ref_latent,
+            ref_strength=ref_strength,
+        )
 
         # Move audio_codec back to CPU to free GPU memory for next generation
         self.audio_codec.to("cpu")
@@ -479,7 +522,7 @@ class HeartMuLaGenPipeline(Pipeline):
 
         # Include tokens in the output so postprocess can optionally persist them.
         # This is opt-in (see postprocess `codes_path`) and does not change default behavior.
-        return ModelOutput(wav=wav, codes=frames.detach().cpu())
+        return ModelOutput(wav=wav, codes=frames.detach().cpu(), ref_audio_path=ref_audio_path)
 
     def postprocess(
         self, model_outputs: ModelOutput, **postprocess_parameters: Any
@@ -488,6 +531,22 @@ class HeartMuLaGenPipeline(Pipeline):
         codes_path: Optional[str] = postprocess_parameters.get("codes_path", None)
         metadata: Optional[Dict[str, Any]] = postprocess_parameters.get("metadata", None)
         wav = model_outputs["wav"]
+        ref_audio_path = model_outputs.get("ref_audio_path", None)
+
+        # Normalize img2img output to match reference audio loudness
+        if ref_audio_path is not None:
+            ref_wav, ref_sr = torchaudio.load(ref_audio_path)
+            # Resample if needed
+            if ref_sr != 48000:
+                ref_wav = torchaudio.transforms.Resample(ref_sr, 48000)(ref_wav)
+
+            # Compute RMS
+            ref_rms = ref_wav.pow(2).mean().sqrt()
+            out_rms = wav.pow(2).mean().sqrt()
+
+            # Scale output to match reference RMS
+            if out_rms > 0:
+                wav = wav * (ref_rms / out_rms)
 
         # Determine format from extension
         if save_path.lower().endswith('.mp3'):
