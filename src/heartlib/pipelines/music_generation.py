@@ -1,15 +1,21 @@
-from transformers.pipelines.base import Pipeline
-from tokenizers import Tokenizer
-from ..heartmula.modeling_heartmula import HeartMuLa
-from ..heartcodec.modeling_heartcodec import HeartCodec
-import torch
-from typing import Dict, Any, Optional
+import json
 import os
 from dataclasses import dataclass
-from tqdm import tqdm
+from contextlib import nullcontext
+from typing import Any, Dict, Optional
+
+import torch
 import torchaudio
-import json
+import torch.nn.functional as F
+from tokenizers import Tokenizer
+from tqdm import tqdm
 from transformers import BitsAndBytesConfig
+from transformers.pipelines.base import Pipeline
+from transformers.utils.generic import ModelOutput
+
+from ..heartcodec.modeling_heartcodec import HeartCodec
+from ..heartmula.modeling_heartmula import HeartMuLa
+from ..accelerators.torchtune_metal import try_enable_torchtune_metal
 
 # Metadata constants for MP3 ID3 tags
 HEARTMULA_METADATA_PREFIX = "HEARTMULA_"
@@ -47,9 +53,8 @@ class HeartMuLaGenPipeline(Pipeline):
             # Manually set attributes that Pipeline.__init__ would set
             self.model = model
             self.device = device
-            self._dtype = dtype  # Use _dtype since dtype is a property
+            self._dtype = dtype
             self.framework = "pt"
-            # Set additional attributes that Pipeline base class sets
             self._num_workers = None
             self._batch_size = None
             self._preprocess_params = {}
@@ -61,7 +66,7 @@ class HeartMuLaGenPipeline(Pipeline):
             self.image_processor = None
             self.processor = None
         else:
-            super().__init__(model, dtype=dtype)
+            super().__init__(model, device=device, dtype=dtype)
             self.model = model
             self._dtype = dtype
 
@@ -69,6 +74,19 @@ class HeartMuLaGenPipeline(Pipeline):
         self.muq_mulan = muq_mulan
         self.text_tokenizer = text_tokenizer
         self.config = config
+        self._device = device
+
+        # Optional, opt-in MPS fast path (custom Metal kernels) for torchtune Llama blocks.
+        # Enable with: HEARTLIB_ENABLE_MPS_METAL=1
+        try:
+            try_enable_torchtune_metal(
+                self.model,
+                enabled=(os.getenv("HEARTLIB_ENABLE_MPS_METAL", "0") == "1"),
+                verbose=(os.getenv("HEARTLIB_MPS_METAL_VERBOSE", "0") == "1"),
+            )
+        except Exception:
+            # Never fail inference if optional kernels are unavailable.
+            pass
 
         self._parallel_number = audio_codec.config.num_quantizers + 1
         self._muq_dim = model.config.muq_dim
@@ -77,52 +95,32 @@ class HeartMuLaGenPipeline(Pipeline):
         preprocess_kwargs = {
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
             "negative_prompt": kwargs.get("negative_prompt", None),
-            "ref_audio": kwargs.get("ref_audio", None),
-            "ref_strength": kwargs.get("ref_strength", 0.7),
         }
         forward_kwargs = {
             "max_audio_length_ms": kwargs.get("max_audio_length_ms", 120_000),
             "temperature": kwargs.get("temperature", 1.0),
             "topk": kwargs.get("topk", 50),
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
-            "stop_check": kwargs.get("stop_check", None),
-            "ref_strength": kwargs.get("ref_strength", 0.7),
             "num_steps": kwargs.get("num_steps", 10),
         }
         postprocess_kwargs = {
             "save_path": kwargs.get("save_path", "output.mp3"),
+            "codes_path": kwargs.get("codes_path", None),
             "metadata": kwargs.get("metadata", None),
         }
         return preprocess_kwargs, forward_kwargs, postprocess_kwargs
 
-    def __call__(self, inputs, **kwargs):
-        """Custom __call__ to ensure proper kwargs passing to all stages."""
-        preprocess_kwargs, forward_kwargs, postprocess_kwargs = self._sanitize_parameters(**kwargs)
+    def preprocess(self, input_: Dict[str, Any], **preprocess_parameters: Any):
+        cfg_scale: float = preprocess_parameters.get("cfg_scale", 1.5)
+        negative_prompt: Optional[str] = preprocess_parameters.get("negative_prompt", None)
 
-        model_inputs = self.preprocess(inputs, **preprocess_kwargs)
-        model_outputs = self._forward(model_inputs, **forward_kwargs)
-        self.postprocess(model_outputs, **postprocess_kwargs)
-
-        return model_outputs
-
-    def preprocess(
-        self,
-        inputs: Dict[str, Any],
-        cfg_scale: float,
-        negative_prompt: str = None,
-        ref_audio: str = None,
-        ref_strength: float = 0.7,
-    ):
-
-        # process tags
-        tags = inputs["tags"]
+        tags = input_["tags"]
         if os.path.isfile(tags):
             with open(tags, encoding="utf-8") as fp:
                 tags = fp.read()
         assert isinstance(tags, str), f"tags must be a string, but got {type(tags)}"
 
         tags = tags.lower()
-        # encapsulate with special <tag> and </tag> tokens
         if not tags.startswith("<tag>"):
             tags = f"<tag>{tags}"
         if not tags.endswith("</tag>"):
@@ -134,33 +132,159 @@ class HeartMuLaGenPipeline(Pipeline):
         if tags_ids[-1] != self.config.text_eos_id:
             tags_ids = tags_ids + [self.config.text_eos_id]
 
-        # process reference audio for img2img-style generation
-        ref_audio_path = inputs.get("ref_audio", ref_audio)
-        ref_latent = None
+        def _load_ref_audio(ref: Any) -> tuple[torch.Tensor, int]:
+            """
+            Returns (mono_waveform, sample_rate) where mono_waveform is 1D [T].
+            """
+            if isinstance(ref, str):
+                wav, sr = torchaudio.load(ref)
+            elif isinstance(ref, torch.Tensor):
+                wav = ref
+                sr = int(input_.get("ref_audio_sr", 0) or 0)
+                if sr <= 0:
+                    raise ValueError(
+                        "ref_audio was provided as a Tensor but `ref_audio_sr` was missing/invalid."
+                    )
+            else:
+                raise TypeError(
+                    f"ref_audio must be a file path or torch.Tensor, got {type(ref)}"
+                )
 
-        if ref_audio_path is not None and os.path.isfile(ref_audio_path):
-            # Move audio_codec to GPU for tokenization if it's on CPU
-            codec_was_on_cpu = next(self.audio_codec.parameters()).device.type == "cpu"
-            if codec_was_on_cpu:
-                self.audio_codec.to(self.device)
+            # Accept [T], [C,T], or [B,C,T] (take the first batch).
+            if wav.ndim == 3:
+                wav = wav[0]
+            if wav.ndim == 2:
+                wav = wav.mean(dim=0)
+            elif wav.ndim != 1:
+                raise ValueError(f"Unsupported ref_audio tensor shape: {tuple(wav.shape)}")
 
-            # Encode reference audio to latent
-            ref_latent = self.audio_codec.tokenize(ref_audio_path, device=self.device)
-            # Move to CPU to free GPU memory during HeartMuLa generation
-            ref_latent = ref_latent.cpu()
+            wav = wav.to(dtype=torch.float32)
+            return wav, int(sr)
 
-            # Move audio_codec back to CPU if it was originally there
-            if codec_was_on_cpu:
-                self.audio_codec.to("cpu")
-                torch.cuda.empty_cache()
+        def _prepare_muq_audio(wav: torch.Tensor, sr: int) -> torch.Tensor:
+            """
+            Resample to MuQ sample rate (default 24k) and take/pad a ~10s segment.
+            Returns waveform shaped [1, T] on self._device.
+            """
+            muq_sr = int(input_.get("muq_sample_rate", 24_000))
+            seg_s = float(input_.get("muq_segment_sec", 10.0))
+            seg_len = max(1, int(round(muq_sr * seg_s)))
 
-            print(f"[img2img] Encoded reference audio: {ref_latent.shape}, strength={ref_strength}")
+            if sr != muq_sr:
+                wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=muq_sr)
 
-        muq_embed = torch.zeros([self._muq_dim], dtype=self._dtype)
+            if wav.numel() >= seg_len:
+                start = (wav.numel() - seg_len) // 2
+                wav = wav[start : start + seg_len]
+            else:
+                wav = F.pad(wav, (0, seg_len - wav.numel()))
+
+            # Common MuQ-style encoders expect [B, T].
+            return wav.unsqueeze(0).to(device=self._device)
+
+        def _run_muq_mulan(audio_bt: torch.Tensor, sample_rate: int) -> torch.Tensor:
+            """
+            Runs the provided MuQ-MuLan model and returns a 1D [muq_dim] embedding.
+            Tries a few common APIs / output layouts.
+            """
+            if self.muq_mulan is None:
+                raise ValueError(
+                    "ref_audio was provided but `muq_mulan` is None. "
+                    "Pass a pretrained MuQ-MuLan model to HeartMuLaGenPipeline."
+                )
+
+            model = self.muq_mulan
+            was_training = getattr(model, "training", False)
+            if hasattr(model, "eval"):
+                model.eval()
+
+            with torch.inference_mode():
+                out = None
+                # Common: model.encode_audio(audio, sample_rate=...)
+                if hasattr(model, "encode_audio") and callable(getattr(model, "encode_audio")):
+                    try:
+                        out = model.encode_audio(audio_bt, sample_rate=sample_rate)
+                    except TypeError:
+                        out = model.encode_audio(audio_bt)
+                # Fallback: callable model(audio, sample_rate=...)
+                if out is None and callable(model):
+                    try:
+                        out = model(audio_bt, sample_rate=sample_rate)
+                    except TypeError:
+                        out = model(audio_bt)
+
+            if was_training and hasattr(model, "train"):
+                model.train()
+
+            def _to_tensor(x: Any) -> Optional[torch.Tensor]:
+                if x is None:
+                    return None
+                if isinstance(x, torch.Tensor):
+                    return x
+                if isinstance(x, (tuple, list)) and x:
+                    return _to_tensor(x[0])
+                if isinstance(x, (dict, ModelOutput)):
+                    for k in (
+                        "joint_embedding",
+                        "joint_embeds",
+                        "embedding",
+                        "embeddings",
+                        "audio_embedding",
+                        "audio_embeds",
+                        "audio_embed",
+                        "audio_features",
+                        "audio_feature",
+                    ):
+                        if k in x:
+                            return _to_tensor(x[k])
+                for attr in (
+                    "joint_embedding",
+                    "embedding",
+                    "embeddings",
+                    "audio_embedding",
+                    "audio_embeds",
+                    "audio_features",
+                ):
+                    if hasattr(x, attr):
+                        return _to_tensor(getattr(x, attr))
+                return None
+
+            emb = _to_tensor(out)
+            if emb is None:
+                raise ValueError(
+                    "Could not extract an embedding from `muq_mulan` output. "
+                    "Expected a Tensor or a dict/ModelOutput with an embedding field."
+                )
+
+            # Accept [D], [1,D], or [B,D] (take first).
+            emb = emb.detach()
+            if emb.ndim == 2:
+                emb = emb[0]
+            elif emb.ndim != 1:
+                raise ValueError(f"Unsupported muq embedding shape: {tuple(emb.shape)}")
+
+            if emb.numel() != self._muq_dim:
+                raise ValueError(
+                    f"MuQ-MuLan embedding dim mismatch: expected {self._muq_dim}, got {emb.numel()}."
+                )
+
+            # Normalize is common for joint embeddings; safe and improves conditioning stability.
+            emb = emb / (emb.norm(p=2) + 1e-12)
+            return emb.to(device="cpu", dtype=self.dtype)
+
+        ref_audio = input_.get("ref_audio", None)
+        if ref_audio is not None:
+            wav, sr = _load_ref_audio(ref_audio)
+            muq_sr = int(input_.get("muq_sample_rate", 24_000))
+            audio_bt = _prepare_muq_audio(wav, sr)
+            muq_embed = _run_muq_mulan(audio_bt, sample_rate=muq_sr)
+        else:
+            muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
+
+        # The reserved slot is the blank "+1" token after tags_ids.
         muq_idx = len(tags_ids)
 
-        # process lyrics
-        lyrics = inputs["lyrics"]
+        lyrics = input_["lyrics"]
         if os.path.isfile(lyrics):
             with open(lyrics, encoding="utf-8") as fp:
                 lyrics = fp.read()
@@ -175,7 +299,6 @@ class HeartMuLaGenPipeline(Pipeline):
         if lyrics_ids[-1] != self.config.text_eos_id:
             lyrics_ids = lyrics_ids + [self.config.text_eos_id]
 
-        # cat them together. tags, ref_audio, lyrics
         prompt_len = len(tags_ids) + 1 + len(lyrics_ids)
 
         tokens = torch.zeros([prompt_len, self._parallel_number], dtype=torch.long)
@@ -187,17 +310,10 @@ class HeartMuLaGenPipeline(Pipeline):
 
         bs_size = 2 if cfg_scale != 1.0 else 1
 
-        def _cfg_cat(tensor: torch.Tensor, cfg_scale: float):
-            tensor = tensor.unsqueeze(0)
-            if cfg_scale != 1.0:
-                tensor = torch.cat([tensor, tensor], dim=0)
-            return tensor
-
-        # process negative prompt for CFG
+        # Process negative prompt for classifier-free guidance
         negative_tokens = None
         if negative_prompt is not None and negative_prompt.strip():
             negative_prompt = negative_prompt.lower()
-            # encapsulate with special <tag> and </tag> tokens (same format as positive tags)
             if not negative_prompt.startswith("<tag>"):
                 negative_prompt = f"<tag>{negative_prompt}"
             if not negative_prompt.endswith("</tag>"):
@@ -209,6 +325,12 @@ class HeartMuLaGenPipeline(Pipeline):
                 negative_ids = negative_ids + [self.config.text_eos_id]
             negative_tokens = torch.tensor(negative_ids, dtype=torch.long)
 
+        def _cfg_cat(tensor: torch.Tensor, scale: float) -> torch.Tensor:
+            tensor = tensor.unsqueeze(0)
+            if scale != 1.0:
+                tensor = torch.cat([tensor, tensor], dim=0)
+            return tensor
+
         return {
             "tokens": _cfg_cat(tokens, cfg_scale),
             "tokens_mask": _cfg_cat(tokens_mask, cfg_scale),
@@ -216,59 +338,74 @@ class HeartMuLaGenPipeline(Pipeline):
             "muq_idx": [muq_idx] * bs_size,
             "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
             "negative_tokens": negative_tokens,
-            "ref_latent": ref_latent,
-            "ref_audio_path": ref_audio_path if ref_latent is not None else None,
         }
 
     def _forward(
         self,
-        model_inputs: Dict[str, Any],
-        max_audio_length_ms: int,
-        temperature: float,
-        topk: int,
-        cfg_scale: float,
-        stop_check: callable = None,
-        ref_strength: float = 0.7,
-        num_steps: int = 10,
-    ):
-        prompt_tokens = model_inputs["tokens"]
-        prompt_tokens_mask = model_inputs["tokens_mask"]
-        continuous_segment = model_inputs["muq_embed"]
-        starts = model_inputs["muq_idx"]
-        prompt_pos = model_inputs["pos"]
-        negative_tokens = model_inputs.get("negative_tokens", None)
-        ref_latent = model_inputs.get("ref_latent", None)
-        ref_audio_path = model_inputs.get("ref_audio_path", None)
+        input_tensors: Dict[str, Any],
+        **forward_parameters: Any,
+    ) -> ModelOutput:
+        max_audio_length_ms: int = forward_parameters.get(
+            "max_audio_length_ms", 120_000
+        )
+        temperature: float = forward_parameters.get("temperature", 1.0)
+        topk: int = forward_parameters.get("topk", 50)
+        cfg_scale: float = forward_parameters.get("cfg_scale", 1.5)
+        num_steps: int = forward_parameters.get("num_steps", 10)
+
+        prompt_tokens = input_tensors["tokens"]
+        prompt_tokens_mask = input_tensors["tokens_mask"]
+        continuous_segment = input_tensors["muq_embed"]
+        starts = input_tensors["muq_idx"]
+        prompt_pos = input_tensors["pos"]
+        negative_tokens = input_tensors.get("negative_tokens", None)
 
         # Ensure model is on the correct device (may have been offloaded after previous generation)
         # Skip this check when block swapping is active, as some parameters are intentionally on CPU
         if not getattr(self, '_skip_auto_move', False):
             model_device = next(self.model.parameters()).device
-            if model_device != self.device:
-                self.model.to(self.device)
+            if model_device != self._device:
+                self.model.to(self._device)
 
         frames = []
 
         bs_size = 2 if cfg_scale != 1.0 else 1
 
         # Move inputs to the correct device
-        prompt_tokens = prompt_tokens.to(self.device)
-        prompt_tokens_mask = prompt_tokens_mask.to(self.device)
-        continuous_segment = continuous_segment.to(self.device)
-        prompt_pos = prompt_pos.to(self.device)
+        prompt_tokens = prompt_tokens.to(self._device)
+        prompt_tokens_mask = prompt_tokens_mask.to(self._device)
+        continuous_segment = continuous_segment.to(self._device)
+        prompt_pos = prompt_pos.to(self._device)
+
+        # Setup caches with explicit device to handle model being temporarily on CPU
+        self.model.setup_caches(bs_size, device=self._device)
 
         # Compute negative embedding for CFG if provided
         negative_embedding = None
         if negative_tokens is not None:
-            negative_tokens = negative_tokens.to(self.device)
+            negative_tokens = negative_tokens.to(self._device)
             with torch.no_grad():
                 neg_embeds = self.model.text_embeddings(negative_tokens)
                 # Mean-pool across all tokens to get a single embedding
                 negative_embedding = neg_embeds.mean(dim=0, keepdim=False)
 
-        # Setup caches with explicit device to handle model being temporarily on CPU
-        self.model.setup_caches(bs_size, device=self.device)
-        with torch.autocast(device_type=self.device.type, dtype=self._dtype):
+        device_type = (
+            self._device.type if isinstance(self._device, torch.device) else "cpu"
+        )
+        # Autocast support varies by PyTorch build/version (not all support "mps").
+        # Prefer autocast when available, but never fail if unsupported.
+        def _autocast_ctx():
+            try:
+                return torch.autocast(device_type=device_type, dtype=self.dtype)
+            except (RuntimeError, TypeError, ValueError):
+                return nullcontext()
+
+        autocast_ctx = _autocast_ctx()
+
+        # Keep a stable view of the base position tensor to avoid re-slicing every step.
+        base_pos = prompt_pos[..., -1:]
+
+        with torch.inference_mode(), autocast_ctx:
             curr_token = self.model.generate_frame(
                 tokens=prompt_tokens,
                 tokens_mask=prompt_tokens_mask,
@@ -280,41 +417,37 @@ class HeartMuLaGenPipeline(Pipeline):
                 starts=starts,
                 negative_embedding=negative_embedding,
             )
-        frames.append(curr_token[0:1,])
 
-        def _pad_audio_token(token: torch.Tensor):
-            padded_token = (
-                torch.ones(
-                    (token.shape[0], self._parallel_number),
-                    device=token.device,
-                    dtype=torch.long,
-                )
-                * self.config.empty_id
+            # Preallocate the padded audio token + mask and reuse them every step.
+            padded_token = torch.full(
+                (curr_token.shape[0], 1, self._parallel_number),
+                fill_value=self.config.empty_id,
+                device=curr_token.device,
+                dtype=torch.long,
             )
-            padded_token[:, :-1] = token
-            padded_token = padded_token.unsqueeze(1)
-            padded_token_mask = torch.ones_like(
-                padded_token, device=token.device, dtype=torch.bool
+            padded_token_mask = torch.ones(
+                (curr_token.shape[0], 1, self._parallel_number),
+                device=curr_token.device,
+                dtype=torch.bool,
             )
             padded_token_mask[..., -1] = False
-            return padded_token, padded_token_mask
 
-        max_audio_frames = max_audio_length_ms // 80
-        eos_check_interval = 10  # Only sync every N frames to reduce CPU-GPU sync overhead
-        eos_threshold = self.config.audio_eos_id
+            max_audio_frames = max_audio_length_ms // 80
+            # Preallocate a frame buffer for the *un-padded* audio tokens (first sample only).
+            frame_buf = torch.empty(
+                (max_audio_frames + 1, curr_token.shape[1]),
+                device=curr_token.device,
+                dtype=curr_token.dtype,
+            )
+            frame_buf[0] = curr_token[0]
+            frame_len = 1
 
-        for i in tqdm(range(max_audio_frames)):
-            # Check for stop signal (infrequent, same interval as EOS)
-            if i % eos_check_interval == 0:
-                if stop_check is not None and stop_check():
-                    break
-
-            curr_token, curr_token_mask = _pad_audio_token(curr_token)
-            with torch.autocast(device_type=self.device.type, dtype=self._dtype):
+            for i in tqdm(range(max_audio_frames)):
+                padded_token[:, 0, :-1] = curr_token
                 curr_token = self.model.generate_frame(
-                    tokens=curr_token,
-                    tokens_mask=curr_token_mask,
-                    input_pos=prompt_pos[..., -1:] + i + 1,
+                    tokens=padded_token,
+                    tokens_mask=padded_token_mask,
+                    input_pos=base_pos + i + 1,
                     temperature=temperature,
                     topk=topk,
                     cfg_scale=cfg_scale,
@@ -322,20 +455,12 @@ class HeartMuLaGenPipeline(Pipeline):
                     starts=None,
                     negative_embedding=negative_embedding,
                 )
+                if torch.any(curr_token[0:1, :] >= self.config.audio_eos_id):
+                    break
+                frame_buf[frame_len] = curr_token[0]
+                frame_len += 1
 
-            frames.append(curr_token[0:1,])
-
-            # Check EOS every N frames to reduce sync overhead
-            if i % eos_check_interval == 0 and torch.any(curr_token[0:1, :] >= eos_threshold):
-                break
-
-        # Trim any frames after EOS token (in case we overshot by up to eos_check_interval frames)
-        if len(frames) > 0:
-            frames_tensor = torch.stack(frames, dim=0)  # [num_frames, 1, num_codebooks]
-            eos_mask = (frames_tensor[:, 0, :] >= eos_threshold).any(dim=-1)
-            if eos_mask.any():
-                first_eos = eos_mask.nonzero(as_tuple=True)[0][0].item()
-                frames = frames[:first_eos]
+        frames = frame_buf[:frame_len].transpose(0, 1).contiguous()
 
         # Offload HeartMuLa model to CPU to free GPU memory for detokenize
         # This prevents OOM during the detokenize step
@@ -343,50 +468,26 @@ class HeartMuLaGenPipeline(Pipeline):
         self.model.to("cpu")
         torch.cuda.empty_cache()
 
-        # Move audio_codec to GPU for detokenization if it's on CPU
-        codec_was_on_cpu = next(self.audio_codec.parameters()).device.type == "cpu"
-        if codec_was_on_cpu:
-            self.audio_codec.to(self.device)
+        # Move audio_codec to GPU for detokenization
+        self.audio_codec.to(self._device)
 
-        frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
+        wav = self.audio_codec.detokenize(frames, num_steps=num_steps)
 
-        # Move ref_latent to GPU if provided
-        if ref_latent is not None:
-            ref_latent = ref_latent.to(self.device)
+        # Move audio_codec back to CPU to free GPU memory for next generation
+        self.audio_codec.to("cpu")
+        torch.cuda.empty_cache()
 
-        wav = self.audio_codec.detokenize(
-            frames,
-            ref_latent=ref_latent,
-            ref_strength=ref_strength,
-            num_steps=num_steps,
-        )
+        # Include tokens in the output so postprocess can optionally persist them.
+        # This is opt-in (see postprocess `codes_path`) and does not change default behavior.
+        return ModelOutput(wav=wav, codes=frames.detach().cpu())
 
-        # Move audio_codec back to CPU if it was originally there
-        if codec_was_on_cpu:
-            self.audio_codec.to("cpu")
-            torch.cuda.empty_cache()
-
-        return {"wav": wav, "ref_audio_path": ref_audio_path}
-
-    def postprocess(self, model_outputs: Dict[str, Any], save_path: str, metadata: Optional[Dict[str, Any]] = None):
+    def postprocess(
+        self, model_outputs: ModelOutput, **postprocess_parameters: Any
+    ) -> None:
+        save_path: str = postprocess_parameters.get("save_path", "output.mp3")
+        codes_path: Optional[str] = postprocess_parameters.get("codes_path", None)
+        metadata: Optional[Dict[str, Any]] = postprocess_parameters.get("metadata", None)
         wav = model_outputs["wav"]
-        ref_audio_path = model_outputs.get("ref_audio_path", None)
-
-        # Normalize img2img output to match reference audio loudness
-        if ref_audio_path is not None:
-            ref_wav, ref_sr = torchaudio.load(ref_audio_path)
-            # Resample if needed
-            if ref_sr != 48000:
-                ref_wav = torchaudio.transforms.Resample(ref_sr, 48000)(ref_wav)
-
-            # Compute RMS
-            ref_rms = ref_wav.pow(2).mean().sqrt()
-            out_rms = wav.pow(2).mean().sqrt()
-
-            # Scale output to match reference RMS
-            if out_rms > 0:
-                wav = wav * (ref_rms / out_rms)
-                print(f"[postprocess] Normalized img2img output: ref_rms={ref_rms:.4f}, out_rms={out_rms:.4f}")
 
         # Determine format from extension
         if save_path.lower().endswith('.mp3'):
@@ -397,13 +498,20 @@ class HeartMuLaGenPipeline(Pipeline):
         # Write metadata to MP3 if provided
         if metadata is not None and save_path.lower().endswith('.mp3'):
             self._write_mp3_metadata(save_path, metadata)
-            print(f"[metadata] Saved metadata to {save_path}")
+
+        if codes_path:
+            codes = model_outputs.get("codes", None)
+            if codes is None:
+                raise ValueError(
+                    "codes_path was provided but no `codes` were found in model outputs."
+                )
+            torch.save(codes, codes_path)
 
     def _write_mp3_metadata(self, save_path: str, metadata: Dict[str, Any]):
         """Write generation metadata to MP3 ID3 tags."""
         try:
             from mutagen.mp3 import MP3
-            from mutagen.id3 import ID3, TXXX, COMM, TIT2, error as ID3Error
+            from mutagen.id3 import TXXX, COMM, TIT2, error as ID3Error
 
             # Load or create ID3 tags
             try:
@@ -505,9 +613,12 @@ class HeartMuLaGenPipeline(Pipeline):
         version: str,
         bnb_config: Optional[BitsAndBytesConfig] = None,
         skip_model_move: bool = False,
-        compile_model: bool = False,
+        *,
+        load_muq_mulan: bool = False,
+        muq_model_id: Optional[str] = None,
+        muq_cache_dir: Optional[str] = None,
+        muq_revision: Optional[str] = None,
     ):
-
         if os.path.exists(
             heartcodec_path := os.path.join(pretrained_path, "HeartCodec-oss")
         ):
@@ -548,8 +659,45 @@ class HeartMuLaGenPipeline(Pipeline):
                 f"Expected to find gen_config.json for HeartMuLa at {gen_config_path} but not found. Please check your folder {pretrained_path}."
             )
 
-        # Optionally compile model for faster inference (Linux only)
-        if compile_model:
-            heartmula.compile_model(mode="reduce-overhead")
+        # Optional: load MuQ-MuLan for reference audio conditioning.
+        # First check for local checkpoint, then fall back to model_id if specified.
+        if not load_muq_mulan:
+            load_muq_mulan = os.getenv("HEARTLIB_LOAD_MUQ_MULAN", "0") == "1"
 
-        return cls(heartmula, heartcodec, None, tokenizer, gen_config, device, dtype, skip_model_move)
+        muq_mulan = None
+        if load_muq_mulan:
+            try:
+                from muq import MuQMuLan  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise ImportError(
+                    "MuQ-MuLan requested, but the `muq` package is not installed. "
+                    "Install it with: pip install muq"
+                ) from e
+
+            # Check for local checkpoint first
+            local_muq_path = os.path.join(pretrained_path, "MuQ-MuLan-large")
+            if os.path.exists(local_muq_path):
+                print(f"[MuQ-MuLan] Loading from local checkpoint: {local_muq_path}")
+                muq_mulan = MuQMuLan.from_pretrained(local_muq_path)
+            else:
+                # Fall back to model_id (HuggingFace or other path)
+                model_id = (
+                    muq_model_id
+                    or os.getenv("HEARTLIB_MUQ_MULAN_ID", "").strip()
+                    or "OpenMuQ/MuQ-MuLan-large"
+                )
+                print(f"[MuQ-MuLan] Loading from: {model_id}")
+                kwargs: Dict[str, Any] = {}
+                if muq_cache_dir is not None:
+                    kwargs["cache_dir"] = muq_cache_dir
+                if muq_revision is not None:
+                    kwargs["revision"] = muq_revision
+                muq_mulan = MuQMuLan.from_pretrained(model_id, **kwargs)
+
+            if hasattr(muq_mulan, "to"):
+                muq_mulan = muq_mulan.to(device)
+            if hasattr(muq_mulan, "eval"):
+                muq_mulan.eval()
+            print(f"[MuQ-MuLan] Model loaded successfully on {device}")
+
+        return cls(heartmula, heartcodec, muq_mulan, tokenizer, gen_config, device, dtype, skip_model_move)

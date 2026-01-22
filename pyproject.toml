@@ -54,6 +54,7 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
 ]
+muq = ["muq"]
 
 [project.urls]
 Homepage = "https://heartmula.github.io/"

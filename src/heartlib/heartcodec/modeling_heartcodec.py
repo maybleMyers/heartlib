@@ -1,11 +1,11 @@
 import torch
-import torchaudio
 from .models.flow_matching import FlowMatching
 from .models.sq_codec import ScalarModel
 from .configuration_heartcodec import HeartCodecConfig
 from transformers.modeling_utils import PreTrainedModel
 import math
 import numpy as np
+from typing import Optional, Union
 
 
 class HeartCodec(PreTrainedModel):
@@ -56,66 +56,6 @@ class HeartCodec(PreTrainedModel):
         self.sample_rate = config.sample_rate
 
     @torch.inference_mode()
-    def tokenize(self, audio_path_or_waveform, device="cuda"):
-        """Convert audio to latent representation for img2img-style generation.
-
-        Args:
-            audio_path_or_waveform: Either a path to an audio file (str) or a waveform tensor [C, T]
-            device: Device to run encoding on
-
-        Returns:
-            latent: Tensor of shape [1, T, 256] - continuous latent for flow matching initialization
-        """
-        # Load audio if path provided
-        if isinstance(audio_path_or_waveform, str):
-            waveform, sr = torchaudio.load(audio_path_or_waveform)
-            print(f"[tokenize] Loaded audio: {audio_path_or_waveform}")
-        else:
-            waveform = audio_path_or_waveform
-            sr = self.sample_rate
-
-        input_duration = waveform.shape[-1] / sr
-        print(f"[tokenize] Input: {waveform.shape}, sr={sr}Hz, duration={input_duration:.2f}s")
-
-        # Resample to 48kHz if needed
-        if sr != self.sample_rate:
-            print(f"[tokenize] Resampling from {sr}Hz to {self.sample_rate}Hz")
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            waveform = resampler(waveform)
-
-        # Ensure stereo (2 channels)
-        if waveform.shape[0] == 1:
-            waveform = waveform.repeat(2, 1)
-        elif waveform.shape[0] > 2:
-            waveform = waveform[:2]
-
-        # Move to device
-        waveform = waveform.to(device)
-
-        # Scalar model expects [batch, num_bands, time] where num_bands=1 (mono)
-        # Treat each stereo channel as a separate batch item: [2, T] -> [2, 1, T]
-        waveform = waveform.unsqueeze(1)  # [2, 1, T_samples]
-        samples_at_48k = waveform.shape[-1]
-        print(f"[tokenize] After resampling: {samples_at_48k} samples at {self.sample_rate}Hz = {samples_at_48k/self.sample_rate:.2f}s")
-
-        # Encode with scalar model: [2, 1, T_samples] -> [2, 128, T_frames]
-        latent = self.scalar_model.encode(waveform)  # [2, 128, T]
-        print(f"[tokenize] Scalar encoder output: {latent.shape} (downsample ratio: {samples_at_48k/latent.shape[-1]:.1f}x)")
-
-        # Reshape stereo latent to match flow matching format
-        # [2, 128, T] -> [1, T, 256]
-        latent = latent.permute(2, 0, 1)  # [T, 2, 128]
-        latent = latent.reshape(latent.shape[0], -1)  # [T, 256]
-        latent = latent.unsqueeze(0)  # [1, T, 256]
-
-        # Calculate effective frame rate
-        latent_frames = latent.shape[1]
-        frame_rate = latent_frames / input_duration
-        print(f"[tokenize] Output latent: {latent.shape}, frames={latent_frames}, frame_rate={frame_rate:.2f}fps")
-
-        return latent
-
-    @torch.inference_mode()
     def detokenize(
         self,
         codes,
@@ -123,10 +63,18 @@ class HeartCodec(PreTrainedModel):
         num_steps=10,
         disable_progress=False,
         guidance_scale=1.25,
-        device="cuda",
-        ref_latent=None,
-        ref_strength=1.0,
+        device: Optional[Union[str, torch.device]] = None,
     ):
+        if device is None:
+            # Prefer the input tensor device; fall back to the model's parameters.
+            if isinstance(codes, torch.Tensor):
+                device = codes.device
+            else:
+                try:
+                    device = next(self.parameters()).device
+                except StopIteration:
+                    device = torch.device("cpu")
+
         codes = codes.unsqueeze(0).to(device)
         first_latent = torch.randn(codes.shape[0], int(duration * 25), 256).to(
             device
@@ -173,8 +121,6 @@ class HeartCodec(PreTrainedModel):
                     num_steps=num_steps,
                     disable_progress=disable_progress,
                     scenario="other_seg",
-                    ref_latent=ref_latent,
-                    ref_strength=ref_strength,
                 )
                 latent_list.append(latents)
             else:
@@ -201,8 +147,6 @@ class HeartCodec(PreTrainedModel):
                     num_steps=num_steps,
                     disable_progress=disable_progress,
                     scenario="other_seg",
-                    ref_latent=ref_latent,
-                    ref_strength=ref_strength,
                 )
                 latent_list.append(latents)
 

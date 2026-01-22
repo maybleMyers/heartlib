@@ -317,8 +317,8 @@ def generate_music(
     output_folder: str,
     compile_model: bool = False,
     ref_audio: str = None,
-    ref_strength: float = 0.7,
     num_steps: int = 10,
+    ref_audio_sec: float = 10.0,
 ):
     """Generate music using HeartMuLa with batch support.
 
@@ -352,6 +352,15 @@ def generate_music(
                 del pipe.audio_codec
             del pipe
 
+        # Reset dynamo/CUDA graphs state safely before garbage collection
+        # This must be done in a try-except because CUDA graphs TLS may not be
+        # initialized in Gradio's worker threads
+        try:
+            torch._dynamo.reset()
+        except (AssertionError, RuntimeError):
+            # TLS not initialized in this thread - safe to ignore
+            pass
+
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -384,11 +393,18 @@ def generate_music(
         if negative_prompt.strip():
             log(f"Negative prompt: {negative_prompt}")
         if ref_audio and os.path.isfile(ref_audio):
-            log(f"Reference audio: {ref_audio} (strength={ref_strength}, steps={num_steps})")
+            log(f"Reference audio: {ref_audio} (analyze {ref_audio_sec}s, steps={num_steps})")
         log(f"Max duration: {max_duration_seconds}s")
         log(f"Temperature: {temperature}, Top-K: {topk}, CFG Scale: {cfg_scale}")
 
         yield (*create_audio_outputs([]), "Loading model...")
+
+        # Reset dynamo state at the start to ensure clean CUDA graphs TLS
+        # in Gradio's worker thread
+        try:
+            torch._dynamo.reset()
+        except (AssertionError, RuntimeError):
+            pass
 
         from heartlib import HeartMuLaGenPipeline
 
@@ -416,6 +432,12 @@ def generate_music(
         # Always use selective loading for better memory efficiency when CUDA available
         use_selective_loading = torch.cuda.is_available()
 
+        # Determine if we should load MuQ-MuLan for reference audio conditioning
+        # This uses semantic embeddings which is how the model was trained
+        should_load_muq = ref_audio is not None and os.path.isfile(ref_audio)
+        if should_load_muq:
+            log("Reference audio provided - loading MuQ-MuLan for semantic conditioning...")
+
         # Load pipeline - skip automatic model move if using selective loading
         pipe = HeartMuLaGenPipeline.from_pretrained(
             model_path,
@@ -423,6 +445,7 @@ def generate_music(
             dtype=dtype,
             version=model_version,
             skip_model_move=use_selective_loading,
+            load_muq_mulan=should_load_muq,
         )
 
         # Set up selective loading for better memory management
@@ -527,6 +550,7 @@ def generate_music(
                 }
                 if ref_audio and os.path.isfile(ref_audio):
                     inputs["ref_audio"] = ref_audio
+                    inputs["muq_segment_sec"] = ref_audio_sec
 
                 # Build metadata dictionary with all generation settings
                 generation_metadata = {
@@ -542,8 +566,9 @@ def generate_music(
                     "model_dtype": model_dtype,
                     "num_gpu_blocks": num_gpu_blocks,
                     "seed": current_seed,
-                    "ref_strength": ref_strength,
                     "num_steps": num_steps,
+                    "ref_audio": ref_audio if ref_audio and os.path.isfile(ref_audio) else "",
+                    "ref_audio_sec": ref_audio_sec if ref_audio and os.path.isfile(ref_audio) else 0,
                     "compile_model": compile_model,
                     "generated_at": datetime.now().isoformat(),
                 }
@@ -556,11 +581,8 @@ def generate_music(
                         topk=topk,
                         temperature=temperature,
                         cfg_scale=cfg_scale,
-                        negative_prompt=negative_prompt if negative_prompt.strip() else None,
-                        stop_check=stop_event.is_set,
-                        ref_audio=ref_audio if ref_audio and os.path.isfile(ref_audio) else None,
-                        ref_strength=ref_strength,
                         num_steps=num_steps,
+                        negative_prompt=negative_prompt if negative_prompt.strip() else None,
                         metadata=generation_metadata,
                     )
                 except AssertionError as e:
@@ -673,24 +695,25 @@ with gr.Blocks(
                 # Right column - Status
                 with gr.Column(scale=1):
                     status_text = gr.Textbox(label="Status", interactive=False, value="Ready", lines=3)
-                    with gr.Accordion("Reference Audio (img2img)", open=True):
+                    with gr.Accordion("Reference Audio", open=True):
+                        gr.Markdown("*Upload audio to transfer its musical style. Uses MuQ-MuLan semantic embeddings.*")
                         ref_audio_input = gr.Audio(
-                            label="Reference Audio (upload to influence generated sound)",
+                            label="Reference Audio",
                             type="filepath",
                         )
-                        ref_strength_slider = gr.Slider(
-                            label="Strength (1.0 = ignore reference, 0.0 = pure reference)",
-                            minimum=0.0,
-                            maximum=1.0,
-                            value=0.7,
-                            step=0.01,
-                        )
                         num_steps_slider = gr.Slider(
-                            label="Diffusion Steps (more = higher quality, slower)",
+                            label="Flow Matching Steps (more = higher quality, slower)",
                             minimum=1,
                             maximum=50,
                             value=10,
                             step=1,
+                        )
+                        ref_audio_sec_slider = gr.Slider(
+                            label="Reference Audio Length (seconds - longer = more style info, averaged from 10s chunks)",
+                            minimum=10,
+                            maximum=120,
+                            value=30,
+                            step=5,
                         )
 
             # Row 2: Buttons
@@ -740,7 +763,7 @@ with gr.Blocks(
                             compile_checkbox = gr.Checkbox(
                                 label="Compile Model (CUDA Graphs)",
                                 value=False,
-                                info="Faster inference on Linux. First run compiles. Not supported on Windows."
+                                info="Faster inference. First run compiles and will be slower."
                             )
 
                     with gr.Accordion("Generation Parameters", open=True):
@@ -850,7 +873,7 @@ with gr.Blocks(
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
                 batch_count, seed, output_folder, compile_checkbox,
-                ref_audio_input, ref_strength_slider, num_steps_slider],
+                ref_audio_input, num_steps_slider, ref_audio_sec_slider],
         outputs=audio_outputs + [status_text]
     )
 
@@ -865,7 +888,7 @@ with gr.Blocks(
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
         max_duration, temperature, topk, cfg_scale, compile_checkbox,
-        ref_strength_slider, num_steps_slider
+        num_steps_slider
     ]
 
     # Keys for the defaults file (must match order of components)
@@ -873,7 +896,7 @@ with gr.Blocks(
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
         "max_duration", "temperature", "topk", "cfg_scale", "compile_model",
-        "ref_strength", "num_steps"
+        "num_steps"
     ]
 
     def save_defaults(*values):
@@ -1000,7 +1023,7 @@ with gr.Blocks(
         # Map metadata to generation tab components
         # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
         # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        # max_duration, temperature, topk, cfg_scale, compile_model, ref_strength
+        # max_duration, temperature, topk, cfg_scale, compile_model, num_steps
         updates = [
             gr.update(value=metadata.get("lyrics", "")),
             gr.update(value=metadata.get("tags", "")),
@@ -1017,7 +1040,7 @@ with gr.Blocks(
             gr.update(value=metadata.get("topk", 50)),
             gr.update(value=metadata.get("cfg_scale", 1.5)),
             gr.update(value=metadata.get("compile_model", False)),
-            gr.update(value=metadata.get("ref_strength", 0.7)),
+            gr.update(value=metadata.get("num_steps", 10)),
         ]
 
         return updates + ["Settings loaded to Generation tab!"]

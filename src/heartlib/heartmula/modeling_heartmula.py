@@ -344,14 +344,9 @@ class HeartMuLa(PreTrainedModel):
                   minimum CPU overhead (best for slow CPUs with fast GPUs).
                   "default" for general optimization.
 
-        Note: Only supported on Linux with CUDA. Windows users should skip this.
+        Note: First compilation will be slower. May have issues on some platforms.
         """
         if self._is_compiled:
-            return
-
-        import sys
-        if sys.platform == "win32":
-            print("Warning: torch.compile not fully supported on Windows, skipping")
             return
 
         try:

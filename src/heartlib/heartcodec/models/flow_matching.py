@@ -64,8 +64,6 @@ class FlowMatching(nn.Module):
         num_steps=20,
         disable_progress=True,
         scenario="start_seg",
-        ref_latent=None,
-        ref_strength=1.0,
     ):
         device = true_latents.device
         dtype = true_latents.dtype
@@ -84,38 +82,9 @@ class FlowMatching(nn.Module):
         ).permute(0, 2, 1)
 
         num_frames = quantized_feature_emb.shape[1]  #
-
-        # Create initial noise
-        noise = torch.randn(
+        latents = torch.randn(
             (batch_size, num_frames, self.latent_dim), device=device, dtype=dtype
         )
-
-        # img2img: Blend reference latent into initial noise
-        # This influences the ENTIRE song while preserving normal diffusion behavior
-        use_img2img = ref_latent is not None and ref_strength < 1.0
-        if use_img2img:
-            ref_latent = ref_latent.to(device=device, dtype=dtype)
-            ref_frames_orig = ref_latent.shape[1]
-            print(f"[img2img] ref_latent: {ref_latent.shape}, target num_frames: {num_frames}")
-            print(f"[img2img] ref_duration: {ref_frames_orig/25:.2f}s, target_duration: {num_frames/25:.2f}s (assuming 25fps)")
-
-            # Match ref_latent to num_frames using crop/tile (preserves tempo)
-            if ref_latent.shape[1] < num_frames:
-                repeats = (num_frames // ref_latent.shape[1]) + 1
-                ref_latent = ref_latent.repeat(1, repeats, 1)[:, :num_frames, :]
-                print(f"[img2img] Tiled reference {repeats}x, cropped to {num_frames} frames")
-            elif ref_latent.shape[1] > num_frames:
-                ref_latent = ref_latent[:, :num_frames, :]
-                print(f"[img2img] Cropped reference from {ref_frames_orig} to {num_frames} frames")
-
-            # Blend reference into initial latents
-            # strength=1.0 -> pure noise (ignore reference)
-            # strength=0.0 -> pure reference
-            latents = ref_strength * noise + (1 - ref_strength) * ref_latent
-            print(f"[img2img] strength={ref_strength}, noise_weight={ref_strength:.2f}, ref_weight={1-ref_strength:.2f}")
-        else:
-            latents = noise
-
         latent_masks = torch.zeros(
             latents.shape[0], latents.shape[1], dtype=torch.int64, device=latents.device
         )
@@ -131,41 +100,28 @@ class FlowMatching(nn.Module):
             0
         )
 
-        # Normal incontext behavior (for segment stitching)
         incontext_latents = (
             true_latents
             * ((latent_masks > 0.5) * (latent_masks < 1.5)).unsqueeze(-1).float()
         )
-        final_incontext_length = ((latent_masks > 0.5) * (latent_masks < 1.5)).sum(-1)[0]
-
-        # img2img: Start from the correct timestep based on ref_strength
-        # In flow matching: t=0 is noise, t=1 is data
-        # ref_strength=0 means we want pure reference (t≈1), ref_strength=1 means pure noise (t=0)
-        if use_img2img:
-            t_start = 1.0 - ref_strength
-            # Ensure we have at least a small step to avoid degenerate cases
-            t_start = min(t_start, 1.0 - 1e-4)
-            print(f"[img2img] Starting flow from t={t_start:.4f}")
-        else:
-            t_start = 0.0
+        incontext_length = ((latent_masks > 0.5) * (latent_masks < 1.5)).sum(-1)[0]
 
         additional_model_input = torch.cat([quantized_feature_emb], 1)
         temperature = 1.0
         t_span = torch.linspace(
-            t_start, 1, num_steps + 1, device=quantized_feature_emb.device
+            0, 1, num_steps + 1, device=quantized_feature_emb.device
         )
         latents = self.solve_euler(
             latents * temperature,
             incontext_latents,
-            final_incontext_length,
+            incontext_length,
             t_span,
             additional_model_input,
             guidance_scale,
         )
 
-        # Replace the incontext region with exact values (for segment stitching)
-        latents[:, 0:final_incontext_length, :] = incontext_latents[
-            :, 0:final_incontext_length, :
+        latents[:, 0:incontext_length, :] = incontext_latents[
+            :, 0:incontext_length, :
         ]  # B, T, dim
         return latents
 
