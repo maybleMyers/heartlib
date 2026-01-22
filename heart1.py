@@ -32,8 +32,9 @@ MODEL_LAYER_COUNTS = {
 # Global stop event for batch cancellation
 stop_event = threading.Event()
 
-# Track if CUDA graphs were used (they can't be safely reused after model reload)
-_cuda_graphs_used = False
+# Global model cache to avoid reloading between generations
+_cached_pipe = None
+_cached_pipe_config = None  # Stores (model_path, model_version, model_dtype, num_gpu_blocks, compile_model)
 
 
 def stop_generation():
@@ -351,26 +352,10 @@ def generate_music(
                 del pipe.audio_codec
             del pipe
 
-        # Reset torch.compile state to free CUDA graph private pools
-        # Wrap in try/except because reset can fail if TLS state is already corrupted
-        try:
-            torch._dynamo.reset()
-        except (AssertionError, RuntimeError) as e:
-            log(f"Warning: torch._dynamo.reset() failed: {e}")
-            # Force clear dynamo caches without touching CUDA graphs
-            try:
-                torch._dynamo.reset_code_caches()
-            except Exception:
-                pass
-
         import gc
-        for _ in range(3):
-            gc.collect()
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            gc.collect()
             torch.cuda.empty_cache()
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
@@ -485,25 +470,13 @@ def generate_music(
             log(f"GPU Memory after model load: {allocated:.2f}GB")
 
         # Optionally compile model for faster inference (reduces CPU overhead)
-        global _cuda_graphs_used
         if compile_model:
-            if _cuda_graphs_used:
-                log("Warning: CUDA graphs were used in a previous run. Skipping compilation to avoid state corruption.")
-                log("  (Restart the application to use CUDA graphs again)")
-                compile_model = False
-            else:
-                # Reset any stale CUDA graph state before compiling
-                try:
-                    torch._dynamo.reset()
-                except (AssertionError, RuntimeError):
-                    pass  # Ignore if already clean or in inconsistent state
-                try:
-                    log("Compiling model with CUDA graphs (first run will be slower)...")
-                    pipe.model.compile_model(mode="reduce-overhead")
-                    _cuda_graphs_used = True  # Mark that CUDA graphs are now active
-                except (AssertionError, RuntimeError) as e:
-                    log(f"Warning: CUDA graph compilation failed ({e}), running without compilation")
-                    compile_model = False  # Disable for this run
+            try:
+                log("Compiling model with CUDA graphs (first run will be slower)...")
+                pipe.model.compile_model(mode="reduce-overhead")
+            except (AssertionError, RuntimeError) as e:
+                log(f"Warning: CUDA graph compilation failed ({e}), running without compilation")
+                compile_model = False  # Disable for this run
 
         # Convert duration from seconds to milliseconds
         max_audio_length_ms = int(max_duration_seconds * 1000)
