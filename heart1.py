@@ -361,6 +361,14 @@ def generate_music(
             # TLS not initialized in this thread - safe to ignore
             pass
 
+        # Reset CUDA graph trees separately - this is required to clear the
+        # thread-local storage that causes AssertionError on subsequent runs
+        try:
+            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+            reset_cudagraph_trees()
+        except (ImportError, AssertionError, RuntimeError):
+            pass
+
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -399,11 +407,16 @@ def generate_music(
 
         yield (*create_audio_outputs([]), "Loading model...")
 
-        # Reset dynamo state at the start to ensure clean CUDA graphs TLS
+        # Reset dynamo and CUDA graph trees state at the start to ensure clean TLS
         # in Gradio's worker thread
         try:
             torch._dynamo.reset()
         except (AssertionError, RuntimeError):
+            pass
+        try:
+            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+            reset_cudagraph_trees()
+        except (ImportError, AssertionError, RuntimeError):
             pass
 
         from heartlib import HeartMuLaGenPipeline
