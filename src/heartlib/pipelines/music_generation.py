@@ -295,6 +295,12 @@ class HeartMuLaGenPipeline(Pipeline):
             if hasattr(self.muq_mulan, 'to'):
                 self.muq_mulan.to("cpu")
             torch.cuda.empty_cache()
+            # Reset CUDA graph trees to prevent stale TLS state on subsequent runs
+            try:
+                from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+                reset_cudagraph_trees()
+            except (ImportError, AssertionError, RuntimeError):
+                pass
         else:
             muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
 
@@ -501,6 +507,12 @@ class HeartMuLaGenPipeline(Pipeline):
         self.model.reset_caches()
         self.model.to("cpu")
         torch.cuda.empty_cache()
+        # Reset CUDA graph trees to prevent stale TLS state on subsequent runs
+        try:
+            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+            reset_cudagraph_trees()
+        except (ImportError, AssertionError, RuntimeError):
+            pass
 
         # Move audio_codec to GPU for detokenization
         self.audio_codec.to(self._device)
@@ -519,6 +531,12 @@ class HeartMuLaGenPipeline(Pipeline):
         # Move audio_codec back to CPU to free GPU memory for next generation
         self.audio_codec.to("cpu")
         torch.cuda.empty_cache()
+        # Reset CUDA graph trees to prevent stale TLS state on subsequent runs
+        try:
+            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+            reset_cudagraph_trees()
+        except (ImportError, AssertionError, RuntimeError):
+            pass
 
         # Include tokens in the output so postprocess can optionally persist them.
         # This is opt-in (see postprocess `codes_path`) and does not change default behavior.
