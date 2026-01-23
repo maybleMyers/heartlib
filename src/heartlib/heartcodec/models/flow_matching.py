@@ -64,6 +64,8 @@ class FlowMatching(nn.Module):
         num_steps=20,
         disable_progress=True,
         scenario="start_seg",
+        ref_latent=None,
+        ref_strength=1.0,
     ):
         device = true_latents.device
         dtype = true_latents.dtype
@@ -82,9 +84,28 @@ class FlowMatching(nn.Module):
         ).permute(0, 2, 1)
 
         num_frames = quantized_feature_emb.shape[1]  #
-        latents = torch.randn(
+
+        # Create initial noise
+        noise = torch.randn(
             (batch_size, num_frames, self.latent_dim), device=device, dtype=dtype
         )
+
+        # img2img: Blend reference latent into initial noise
+        use_img2img = ref_latent is not None and ref_strength < 1.0
+        if use_img2img:
+            ref_latent = ref_latent.to(device=device, dtype=dtype)
+            # Match ref_latent to num_frames using crop/tile (preserves tempo)
+            if ref_latent.shape[1] < num_frames:
+                repeats = (num_frames // ref_latent.shape[1]) + 1
+                ref_latent = ref_latent.repeat(1, repeats, 1)[:, :num_frames, :]
+            elif ref_latent.shape[1] > num_frames:
+                ref_latent = ref_latent[:, :num_frames, :]
+
+            # Blend: strength=1.0 -> pure noise, strength=0.0 -> pure reference
+            latents = ref_strength * noise + (1 - ref_strength) * ref_latent
+        else:
+            latents = noise
+
         latent_masks = torch.zeros(
             latents.shape[0], latents.shape[1], dtype=torch.int64, device=latents.device
         )
@@ -108,8 +129,18 @@ class FlowMatching(nn.Module):
 
         additional_model_input = torch.cat([quantized_feature_emb], 1)
         temperature = 1.0
+
+        # img2img: Start from correct timestep based on ref_strength
+        # In flow matching: t=0 is noise, t=1 is data
+        # ref_strength=0 means we want pure reference (t≈1), ref_strength=1 means pure noise (t=0)
+        if use_img2img:
+            t_start = 1.0 - ref_strength
+            t_start = min(t_start, 1.0 - 1e-4)  # Ensure at least a small step
+        else:
+            t_start = 0.0
+
         t_span = torch.linspace(
-            0, 1, num_steps + 1, device=quantized_feature_emb.device
+            t_start, 1, num_steps + 1, device=quantized_feature_emb.device
         )
         latents = self.solve_euler(
             latents * temperature,

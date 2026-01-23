@@ -43,189 +43,6 @@ def stop_generation():
     return "Stopping..."
 
 
-def _params_to_device(module, device, non_blocking=True):
-    """Move only PARAMETERS (weights) to device, NOT buffers.
-
-    This is critical for torchtune models because buffers like RoPE cache
-    must stay on GPU while parameters can be swapped to CPU.
-    """
-    for submodule in module.modules():
-        for param_name, param in list(submodule.named_parameters(recurse=False)):
-            if param is not None:
-                param.data = param.data.to(device, non_blocking=non_blocking)
-
-
-def _ensure_buffers_on_device(module, device):
-    """Ensure all buffers are on the specified device."""
-    for name, buf in module.named_buffers(recurse=True):
-        if buf is not None and buf.device.type != device.type:
-            # Use setattr on parent module to properly update the buffer
-            parts = name.rsplit('.', 1)
-            if len(parts) == 2:
-                parent_name, buf_name = parts
-                parent = module.get_submodule(parent_name)
-            else:
-                parent = module
-                buf_name = name
-            parent.register_buffer(buf_name, buf.to(device))
-
-
-class BlockSwapManager:
-    """Manages CPU/GPU block swapping for transformer layers.
-
-    Uses the LTX-style approach: only swap PARAMETERS (weights), keep
-    BUFFERS (like RoPE position embedding caches) on GPU at all times.
-    """
-
-    def __init__(self, model, num_gpu_blocks: int, device: torch.device):
-        self.model = model
-        self.num_gpu_blocks = num_gpu_blocks
-        self.device = device
-        self.cpu_device = torch.device("cpu")
-        self.total_blocks = 0
-        self.swapped_blocks = []
-        self.original_forwards = {}
-        self.buffers_initialized = False
-
-    def _ensure_all_buffers_on_gpu(self):
-        """Ensure ALL buffers in the backbone stay on GPU."""
-        if self.buffers_initialized:
-            return
-        backbone = self.model.backbone
-        # Move all buffers to GPU and keep them there
-        for name, buf in backbone.named_buffers(recurse=True):
-            if buf is not None and buf.device.type != 'cuda':
-                # Find the module that owns this buffer and update it
-                parts = name.rsplit('.', 1)
-                if len(parts) == 2:
-                    parent_name, buf_name = parts
-                    try:
-                        parent = backbone.get_submodule(parent_name)
-                        parent.register_buffer(buf_name, buf.to(self.device))
-                    except AttributeError:
-                        pass
-                else:
-                    backbone.register_buffer(name, buf.to(self.device))
-        self.buffers_initialized = True
-
-    def setup(self):
-        """Set up block swapping by wrapping forward methods."""
-        backbone = self.model.backbone
-
-        if not hasattr(backbone, 'layers'):
-            log("Warning: Cannot find 'layers' attribute for block swapping")
-            return False
-
-        self.total_blocks = len(backbone.layers)
-        blocks_to_swap = max(0, self.total_blocks - self.num_gpu_blocks)
-
-        if blocks_to_swap == 0:
-            log(f"All {self.total_blocks} blocks kept on GPU (no swapping needed)")
-            return True
-
-        log(f"Setting up block swapping: {self.num_gpu_blocks} on GPU, {blocks_to_swap} swapped to CPU")
-
-        # First, ensure ALL buffers (including RoPE cache) are on GPU
-        self._ensure_all_buffers_on_gpu()
-
-        # Move the LAST N blocks' PARAMETERS to CPU (they're used later in forward pass)
-        # Keep buffers on GPU!
-        swap_start_idx = self.num_gpu_blocks
-
-        for i in range(swap_start_idx, self.total_blocks):
-            layer = backbone.layers[i]
-
-            # Store original forward
-            self.original_forwards[i] = layer.forward
-
-            # Create wrapped forward that handles device transfer for PARAMETERS ONLY
-            def make_swapping_forward(layer_ref, orig_forward, idx, manager):
-                def swapping_forward(*args, **kwargs):
-                    # Move layer PARAMETERS to GPU (buffers already on GPU)
-                    _params_to_device(layer_ref, manager.device, non_blocking=False)
-                    if manager.device.type == 'cuda':
-                        torch.cuda.synchronize()
-
-                    # Run forward (all tensors should already be on GPU)
-                    result = orig_forward(*args, **kwargs)
-
-                    # Move layer PARAMETERS back to CPU
-                    _params_to_device(layer_ref, manager.cpu_device, non_blocking=True)
-
-                    return result
-                return swapping_forward
-
-            # Replace forward method
-            layer.forward = make_swapping_forward(layer, self.original_forwards[i], i, self)
-
-            # Move layer PARAMETERS to CPU, but keep buffers on GPU
-            _params_to_device(layer, self.cpu_device, non_blocking=False)
-            self.swapped_blocks.append(i)
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        log(f"Block swapping ready: blocks {swap_start_idx}-{self.total_blocks-1} will swap from CPU")
-        log(f"  (Buffers like RoPE cache remain on GPU)")
-        return True
-
-    def cleanup(self):
-        """Restore original forwards. Model will be moved to CPU separately during full cleanup."""
-        if hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'layers'):
-            for i, orig_forward in self.original_forwards.items():
-                self.model.backbone.layers[i].forward = orig_forward
-        self.original_forwards = {}
-        self.swapped_blocks = []
-        self.buffers_initialized = False
-
-    def restore_state(self):
-        """Restore block swapping state after model was moved to CPU.
-
-        This is needed when the model is offloaded to CPU during generation
-        (e.g., for codec detokenization) and needs to be restored for the
-        next generation in a batch.
-        """
-        if not self.swapped_blocks:
-            return
-
-        backbone = self.model.backbone
-
-        # Move non-swapped blocks (first N blocks) back to GPU
-        for i in range(self.num_gpu_blocks):
-            if i < len(backbone.layers):
-                backbone.layers[i].to(self.device)
-
-        # Move non-layer components back to GPU
-        self.model.text_embeddings.to(self.device)
-        self.model.audio_embeddings.to(self.device)
-        self.model.unconditional_text_embedding.to(self.device)
-        self.model.projection.to(self.device)
-        self.model.codebook0_head.to(self.device)
-        self.model.audio_head.data = self.model.audio_head.data.to(self.device)
-        self.model.muq_linear.to(self.device)
-        backbone.norm.to(self.device)
-        self.model.decoder.to(self.device)
-
-        # Swapped blocks should stay on CPU - move their params back to CPU
-        # (they may have been moved to GPU by model.to(device) in _forward)
-        for i in self.swapped_blocks:
-            _params_to_device(backbone.layers[i], self.cpu_device, non_blocking=False)
-
-        # Ensure all buffers are on GPU
-        self.buffers_initialized = False
-        self._ensure_all_buffers_on_gpu()
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    def get_memory_stats(self):
-        """Get current GPU memory usage."""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        return "CUDA not available"
-
-
 def log(message: str):
     """Log a message to the console."""
     print(message)
@@ -316,7 +133,9 @@ def generate_music(
     seed: int,
     output_folder: str,
     compile_model: bool = False,
-    ref_audio: str = None,
+    ref_audio_semantic: str = None,
+    ref_audio_img2img: str = None,
+    ref_strength: float = 0.5,
     num_steps: int = 10,
     ref_audio_sec: float = 10.0,
 ):
@@ -328,7 +147,7 @@ def generate_music(
     stop_event.clear()
 
     pipe = None
-    block_swap_manager = None
+    block_swap_enabled = False
     all_generated_music = []
     all_seeds = []
     batch_count = int(batch_count)
@@ -336,9 +155,7 @@ def generate_music(
 
     def cleanup():
         """Clean up GPU memory."""
-        nonlocal pipe, block_swap_manager
-        if block_swap_manager is not None:
-            block_swap_manager.cleanup()
+        nonlocal pipe
         if pipe is not None:
             if hasattr(pipe, 'model') and pipe.model is not None:
                 try:
@@ -400,8 +217,10 @@ def generate_music(
         log(f"Tags: {tags}")
         if negative_prompt.strip():
             log(f"Negative prompt: {negative_prompt}")
-        if ref_audio and os.path.isfile(ref_audio):
-            log(f"Reference audio: {ref_audio} (analyze {ref_audio_sec}s, steps={num_steps})")
+        if ref_audio_semantic and os.path.isfile(ref_audio_semantic):
+            log(f"Semantic reference: {ref_audio_semantic} (analyze {ref_audio_sec}s)")
+        if ref_audio_img2img and os.path.isfile(ref_audio_img2img):
+            log(f"Audio reference (img2img): {ref_audio_img2img} (strength={ref_strength}, steps={num_steps})")
         log(f"Max duration: {max_duration_seconds}s")
         log(f"Temperature: {temperature}, Top-K: {topk}, CFG Scale: {cfg_scale}")
 
@@ -447,9 +266,9 @@ def generate_music(
 
         # Determine if we should load MuQ-MuLan for reference audio conditioning
         # This uses semantic embeddings which is how the model was trained
-        should_load_muq = ref_audio is not None and os.path.isfile(ref_audio)
+        should_load_muq = ref_audio_semantic is not None and os.path.isfile(ref_audio_semantic)
         if should_load_muq:
-            log("Reference audio provided - loading MuQ-MuLan for semantic conditioning...")
+            log("Semantic reference audio provided - loading MuQ-MuLan for semantic conditioning...")
 
         # Load pipeline - skip automatic model move if using selective loading
         pipe = HeartMuLaGenPipeline.from_pretrained(
@@ -484,16 +303,17 @@ def generate_music(
 
             # Only set up block swapping if some blocks need to stay on CPU
             if effective_gpu_blocks < total_blocks:
-                block_swap_manager = BlockSwapManager(pipe.model, effective_gpu_blocks, device)
-                if block_swap_manager.setup():
-                    blocks_swapped = total_blocks - effective_gpu_blocks
-                    log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_swapped} swap from CPU")
-                    log(block_swap_manager.get_memory_stats())
-                    # Prevent pipeline from moving entire model to GPU during generation
-                    pipe._skip_auto_move = True
-                else:
-                    block_swap_manager = None
-                    log("Block swapping setup failed, keeping partial GPU load")
+                blocks_to_swap = total_blocks - effective_gpu_blocks
+                pipe.model.enable_block_swap(blocks_to_swap, device)
+                pipe.model.prepare_block_swap_before_forward()
+                block_swap_enabled = True
+                log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_to_swap} swap from CPU")
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    log(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                # Prevent pipeline from moving entire model to GPU during generation
+                pipe._skip_auto_move = True
             else:
                 log(f"All {total_blocks} blocks on GPU (no swapping needed)")
                 log(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
@@ -505,13 +325,14 @@ def generate_music(
             allocated = torch.cuda.memory_allocated() / 1024**3
             log(f"GPU Memory after model load: {allocated:.2f}GB")
 
-        # Optionally compile model for faster inference (reduces CPU overhead)
+        # Optionally compile model for faster inference
+        # Note: torch.compile now works with block swapping (WAN-style orchestration)
         if compile_model:
             try:
-                log("Compiling model with CUDA graphs (first run will be slower)...")
-                pipe.model.compile_model(mode="reduce-overhead")
+                log("Compiling model (first run will be slower)...")
+                pipe.model.compile_model(mode="max-autotune-no-cudagraphs")
             except (AssertionError, RuntimeError) as e:
-                log(f"Warning: CUDA graph compilation failed ({e}), running without compilation")
+                log(f"Warning: Compilation failed ({e}), running without compilation")
                 compile_model = False  # Disable for this run
 
         # Convert duration from seconds to milliseconds
@@ -561,8 +382,9 @@ def generate_music(
                     "lyrics": lyrics,
                     "tags": tags,
                 }
-                if ref_audio and os.path.isfile(ref_audio):
-                    inputs["ref_audio"] = ref_audio
+                # Semantic reference for MuQ-MuLan style guidance
+                if ref_audio_semantic and os.path.isfile(ref_audio_semantic):
+                    inputs["ref_audio"] = ref_audio_semantic
                     inputs["muq_segment_sec"] = ref_audio_sec
 
                 # Build metadata dictionary with all generation settings
@@ -580,23 +402,35 @@ def generate_music(
                     "num_gpu_blocks": num_gpu_blocks,
                     "seed": current_seed,
                     "num_steps": num_steps,
-                    "ref_audio": ref_audio if ref_audio and os.path.isfile(ref_audio) else "",
-                    "ref_audio_sec": ref_audio_sec if ref_audio and os.path.isfile(ref_audio) else 0,
+                    "ref_audio_semantic": ref_audio_semantic if ref_audio_semantic and os.path.isfile(ref_audio_semantic) else "",
+                    "ref_audio_img2img": ref_audio_img2img if ref_audio_img2img and os.path.isfile(ref_audio_img2img) else "",
+                    "ref_strength": ref_strength,
+                    "ref_audio_sec": ref_audio_sec if ref_audio_semantic and os.path.isfile(ref_audio_semantic) else 0,
                     "compile_model": compile_model,
                     "generated_at": datetime.now().isoformat(),
                 }
 
+                # Prepare pipeline kwargs
+                pipe_kwargs = {
+                    "max_audio_length_ms": max_audio_length_ms,
+                    "save_path": output_path,
+                    "topk": topk,
+                    "temperature": temperature,
+                    "cfg_scale": cfg_scale,
+                    "num_steps": num_steps,
+                    "negative_prompt": negative_prompt if negative_prompt.strip() else None,
+                    "metadata": generation_metadata,
+                }
+
+                # Add img2img reference if provided
+                if ref_audio_img2img and os.path.isfile(ref_audio_img2img):
+                    pipe_kwargs["ref_audio"] = ref_audio_img2img
+                    pipe_kwargs["ref_strength"] = ref_strength
+
                 try:
                     pipe(
                         inputs,
-                        max_audio_length_ms=max_audio_length_ms,
-                        save_path=output_path,
-                        topk=topk,
-                        temperature=temperature,
-                        cfg_scale=cfg_scale,
-                        num_steps=num_steps,
-                        negative_prompt=negative_prompt if negative_prompt.strip() else None,
-                        metadata=generation_metadata,
+                        **pipe_kwargs,
                     )
                 except AssertionError as e:
                     if "is_key_in_tls" in str(e) or "tree_manager" in str(e):
@@ -623,8 +457,8 @@ def generate_music(
                 log(f"GPU Memory after song {i+1}: {allocated:.2f}GB")
 
             # Restore block swapping state for next generation in batch
-            if block_swap_manager is not None and i < batch_count - 1:
-                block_swap_manager.restore_state()
+            if block_swap_enabled and i < batch_count - 1:
+                pipe.model.prepare_block_swap_before_forward()
 
         # Final status
         final_status = f"Completed {batch_count} song(s)!" if batch_count > 1 else "Generation complete!"
@@ -709,10 +543,29 @@ with gr.Blocks(
                 with gr.Column(scale=1):
                     status_text = gr.Textbox(label="Status", interactive=False, value="Ready", lines=3)
                     with gr.Accordion("Reference Audio", open=True):
-                        gr.Markdown("*Upload audio to transfer its musical style. Uses MuQ-MuLan semantic embeddings.*")
-                        ref_audio_input = gr.Audio(
-                            label="Reference Audio",
+                        gr.Markdown("**Semantic Reference** - *Transfers high-level style (genre, mood) via MuQ-MuLan*")
+                        ref_audio_semantic = gr.Audio(
+                            label="Semantic Reference (style/genre)",
                             type="filepath",
+                        )
+                        ref_audio_sec_slider = gr.Slider(
+                            label="Semantic analysis length (seconds)",
+                            minimum=10,
+                            maximum=120,
+                            value=30,
+                            step=5,
+                        )
+                        gr.Markdown("**Audio Reference (img2img)** - *Transfers timbre, rhythm, texture directly*")
+                        ref_audio_img2img = gr.Audio(
+                            label="Audio Reference (timbre/rhythm)",
+                            type="filepath",
+                        )
+                        ref_strength_slider = gr.Slider(
+                            label="Reference Strength (0=pure ref, 1=ignore ref)",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.5,
+                            step=0.05,
                         )
                         num_steps_slider = gr.Slider(
                             label="Flow Matching Steps (more = higher quality, slower)",
@@ -720,13 +573,6 @@ with gr.Blocks(
                             maximum=50,
                             value=10,
                             step=1,
-                        )
-                        ref_audio_sec_slider = gr.Slider(
-                            label="Reference Audio Length (seconds - longer = more style info, averaged from 10s chunks)",
-                            minimum=10,
-                            maximum=120,
-                            value=30,
-                            step=5,
                         )
 
             # Row 2: Buttons
@@ -851,6 +697,14 @@ with gr.Blocks(
                         with gr.Row():
                             info_topk = gr.Textbox(label="Top-K", interactive=False)
                             info_cfg_scale = gr.Textbox(label="CFG Scale", interactive=False)
+                            info_num_steps = gr.Textbox(label="Flow Steps", interactive=False)
+
+                    with gr.Accordion("Reference Audio Settings", open=True):
+                        with gr.Row():
+                            info_ref_audio_semantic = gr.Textbox(label="Semantic Reference", interactive=False)
+                            info_ref_audio_sec = gr.Textbox(label="Semantic Length (s)", interactive=False)
+                        with gr.Row():
+                            info_ref_audio_img2img = gr.Textbox(label="img2img Reference", interactive=False)
                             info_ref_strength = gr.Textbox(label="Ref Strength", interactive=False)
 
                     with gr.Accordion("Model Settings", open=True):
@@ -886,7 +740,8 @@ with gr.Blocks(
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
                 batch_count, seed, output_folder, compile_checkbox,
-                ref_audio_input, num_steps_slider, ref_audio_sec_slider],
+                ref_audio_semantic, ref_audio_img2img, ref_strength_slider,
+                num_steps_slider, ref_audio_sec_slider],
         outputs=audio_outputs + [status_text]
     )
 
@@ -901,7 +756,7 @@ with gr.Blocks(
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
         max_duration, temperature, topk, cfg_scale, compile_checkbox,
-        num_steps_slider
+        num_steps_slider, ref_strength_slider, ref_audio_sec_slider
     ]
 
     # Keys for the defaults file (must match order of components)
@@ -909,7 +764,7 @@ with gr.Blocks(
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
         "max_duration", "temperature", "topk", "cfg_scale", "compile_model",
-        "num_steps"
+        "num_steps", "ref_strength", "ref_audio_sec"
     ]
 
     def save_defaults(*values):
@@ -965,56 +820,47 @@ with gr.Blocks(
 
     def load_mp3_metadata(audio_path):
         """Load and display metadata from an MP3 file."""
+        # Number of display fields (excluding state and status)
+        num_fields = 18
+        empty_result = (None, "") + tuple([""] * num_fields)
+
         if audio_path is None:
-            return (
-                None,  # metadata state
-                "",    # status
-                "",    # lyrics
-                "",    # tags
-                "",    # negative_prompt
-                "",    # seed
-                "",    # max_duration
-                "",    # temperature
-                "",    # topk
-                "",    # cfg_scale
-                "",    # ref_strength
-                "",    # model_version
-                "",    # model_dtype
-                "",    # num_gpu_blocks
-                "",    # model_path
-                "",    # generated_at
-            )
+            return empty_result
 
         if not audio_path.lower().endswith('.mp3'):
-            return (
-                None,
-                "Please upload an MP3 file.",
-                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
-            )
+            return (None, "Please upload an MP3 file.") + tuple([""] * num_fields)
 
         try:
             from heartlib import HeartMuLaGenPipeline
             metadata = HeartMuLaGenPipeline.read_mp3_metadata(audio_path)
 
             if metadata is None:
-                return (
-                    None,
-                    "No HeartMuLa metadata found in this MP3.",
-                    "", "", "", "", "", "", "", "", "", "", "", "", "", ""
-                )
+                return (None, "No HeartMuLa metadata found in this MP3.") + tuple([""] * num_fields)
+
+            # Extract ref_audio paths (handle both old and new metadata formats)
+            ref_semantic = metadata.get("ref_audio_semantic", metadata.get("ref_audio", ""))
+            ref_img2img = metadata.get("ref_audio_img2img", "")
 
             return (
                 metadata,  # state
-                "Metadata loaded successfully!",
+                "Metadata loaded successfully!",  # status
+                # Metadata Preview
                 metadata.get("lyrics", ""),
                 metadata.get("tags", ""),
                 metadata.get("negative_prompt", ""),
+                # Generation Parameters
                 str(metadata.get("seed", "")),
                 str(metadata.get("max_duration", "")),
                 str(metadata.get("temperature", "")),
                 str(metadata.get("topk", "")),
                 str(metadata.get("cfg_scale", "")),
+                str(metadata.get("num_steps", "")),
+                # Reference Audio Settings
+                os.path.basename(ref_semantic) if ref_semantic else "",
+                str(metadata.get("ref_audio_sec", "")),
+                os.path.basename(ref_img2img) if ref_img2img else "",
                 str(metadata.get("ref_strength", "")),
+                # Model Settings
                 metadata.get("model_version", ""),
                 metadata.get("model_dtype", ""),
                 str(metadata.get("num_gpu_blocks", "")),
@@ -1022,21 +868,17 @@ with gr.Blocks(
                 metadata.get("generated_at", ""),
             )
         except Exception as e:
-            return (
-                None,
-                f"Error reading metadata: {e}",
-                "", "", "", "", "", "", "", "", "", "", "", "", "", ""
-            )
+            return (None, f"Error reading metadata: {e}") + tuple([""] * num_fields)
 
     def send_settings_to_generation(metadata):
         """Send loaded metadata settings to the generation tab."""
         if metadata is None:
-            return [gr.update()] * 16 + ["No metadata loaded. Please upload an MP3 first."]
+            return [gr.update()] * 18 + ["No metadata loaded. Please upload an MP3 first."]
 
         # Map metadata to generation tab components
         # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
         # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        # max_duration, temperature, topk, cfg_scale, compile_model, num_steps
+        # max_duration, temperature, topk, cfg_scale, compile_model, num_steps, ref_strength, ref_audio_sec
         updates = [
             gr.update(value=metadata.get("lyrics", "")),
             gr.update(value=metadata.get("tags", "")),
@@ -1054,15 +896,24 @@ with gr.Blocks(
             gr.update(value=metadata.get("cfg_scale", 1.5)),
             gr.update(value=metadata.get("compile_model", False)),
             gr.update(value=metadata.get("num_steps", 10)),
+            gr.update(value=metadata.get("ref_strength", 0.5)),
+            gr.update(value=metadata.get("ref_audio_sec", 30)),
         ]
 
         return updates + ["Settings loaded to Generation tab!"]
 
     # Info display components for Audio Info tab
+    # Order must match load_mp3_metadata return values
     info_display_components = [
+        # Metadata Preview
         info_lyrics, info_tags, info_negative_prompt,
+        # Generation Parameters
         info_seed, info_max_duration, info_temperature,
-        info_topk, info_cfg_scale, info_ref_strength,
+        info_topk, info_cfg_scale, info_num_steps,
+        # Reference Audio Settings
+        info_ref_audio_semantic, info_ref_audio_sec,
+        info_ref_audio_img2img, info_ref_strength,
+        # Model Settings
         info_model_version, info_model_dtype, info_num_gpu_blocks,
         info_model_path, info_generated_at
     ]

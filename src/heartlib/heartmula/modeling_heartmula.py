@@ -274,7 +274,13 @@ class HeartMuLa(PreTrainedModel):
                 )
             # Use pre-allocated batch indices
             h[self._batch_indices[:b], starts] = continuous_segments
-        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
+
+        # Forward through backbone - use swap-aware path if block swapping enabled
+        if hasattr(self, 'blocks_to_swap') and self.blocks_to_swap:
+            h = self._forward_backbone_with_swap(h, input_pos, curr_backbone_mask)
+        else:
+            h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask)
+
         last_h = h[:, -1, :]  # the last frame
         c0_logits = self.codebook0_head(last_h)  # only predict the audio part
 
@@ -336,13 +342,13 @@ class HeartMuLa(PreTrainedModel):
         self.backbone.reset_caches()
         self.decoder.reset_caches()
 
-    def compile_model(self, mode: str = "reduce-overhead"):
+    def compile_model(self, mode: str = "max-autotune-no-cudagraphs"):
         """Compile the model with torch.compile for faster inference.
 
         Args:
-            mode: Compilation mode. "reduce-overhead" uses CUDA graphs for
-                  minimum CPU overhead (best for slow CPUs with fast GPUs).
-                  "default" for general optimization.
+            mode: Compilation mode. Default "max-autotune-no-cudagraphs" is compatible
+                  with block swapping. "reduce-overhead" uses CUDA graphs (incompatible
+                  with block swapping).
 
         Note: First compilation will be slower. May have issues on some platforms.
         """
@@ -350,12 +356,58 @@ class HeartMuLa(PreTrainedModel):
             return
 
         try:
-            self.backbone = torch.compile(self.backbone, mode=mode)
-            self.decoder = torch.compile(self.decoder, mode=mode)
+            self.backbone = torch.compile(self.backbone, mode=mode, dynamic=True)
+            self.decoder = torch.compile(self.decoder, mode=mode, dynamic=True)
             self._is_compiled = True
-            print(f"Model compiled with mode='{mode}'")
+            print(f"Model compiled with mode='{mode}', dynamic=True")
         except Exception as e:
             print(f"Warning: torch.compile failed: {e}")
+
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device):
+        """Enable block swapping for memory-efficient inference.
+
+        This method sets up async CPU/GPU block swapping that is compatible
+        with torch.compile. Swapping is orchestrated from generate_frame(),
+        not by wrapping layer forwards.
+
+        Args:
+            blocks_to_swap: Number of blocks to keep on CPU and swap during forward.
+            device: GPU device for inference.
+        """
+        from heartlib.utils.offloading import ModelOffloader
+
+        self.blocks_to_swap = blocks_to_swap
+        self._swap_device = device
+        self.num_blocks = len(self.backbone.layers)
+
+        assert blocks_to_swap < self.num_blocks, (
+            f"Cannot swap {blocks_to_swap} blocks, model only has {self.num_blocks} blocks"
+        )
+
+        self.offloader = ModelOffloader(
+            "heartmula_backbone",
+            self.backbone.layers,
+            self.num_blocks,
+            blocks_to_swap,
+            supports_backward=False,
+            device=device,
+        )
+        print(f"HeartMuLa: Block swap enabled. {self.num_blocks - blocks_to_swap} on GPU, {blocks_to_swap} swapped from CPU.")
+
+    def prepare_block_swap_before_forward(self):
+        """Prepare block devices before forward pass."""
+        if hasattr(self, 'offloader') and self.blocks_to_swap:
+            self.offloader.prepare_block_devices_before_forward(self.backbone.layers)
+
+    def _forward_backbone_with_swap(self, h, input_pos, mask):
+        """Forward through backbone with block swapping orchestration."""
+        for block_idx, layer in enumerate(self.backbone.layers):
+            self.offloader.wait_for_block(block_idx)
+            h = layer(h, mask=mask, input_pos=input_pos)
+            self.offloader.submit_move_blocks_forward(self.backbone.layers, block_idx)
+        # Apply final norm (unembed without output projection since we replaced it with Identity)
+        h = self.backbone.norm(h)
+        return h
 
     def _embed_local_audio(self, tokens):
         """the token from 0-30"""
