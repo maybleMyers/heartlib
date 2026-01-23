@@ -286,6 +286,10 @@ class HeartMuLaGenPipeline(Pipeline):
 
         # Process semantic reference for MuQ-MuLan embedding
         if ref_audio_semantic is not None and self.muq_mulan is not None:
+            # Restore MuQ-MuLan to GPU before use (may have been offloaded after previous song)
+            if hasattr(self.muq_mulan, 'to'):
+                self.muq_mulan.to(self._device)
+
             wav, sr = _load_ref_audio(ref_audio_semantic)
             muq_sr = int(input_.get("muq_sample_rate", 24_000))
             audio_bt = _prepare_muq_audio(wav, sr)

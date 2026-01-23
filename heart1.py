@@ -43,189 +43,6 @@ def stop_generation():
     return "Stopping..."
 
 
-def _params_to_device(module, device, non_blocking=True):
-    """Move only PARAMETERS (weights) to device, NOT buffers.
-
-    This is critical for torchtune models because buffers like RoPE cache
-    must stay on GPU while parameters can be swapped to CPU.
-    """
-    for submodule in module.modules():
-        for param_name, param in list(submodule.named_parameters(recurse=False)):
-            if param is not None:
-                param.data = param.data.to(device, non_blocking=non_blocking)
-
-
-def _ensure_buffers_on_device(module, device):
-    """Ensure all buffers are on the specified device."""
-    for name, buf in module.named_buffers(recurse=True):
-        if buf is not None and buf.device.type != device.type:
-            # Use setattr on parent module to properly update the buffer
-            parts = name.rsplit('.', 1)
-            if len(parts) == 2:
-                parent_name, buf_name = parts
-                parent = module.get_submodule(parent_name)
-            else:
-                parent = module
-                buf_name = name
-            parent.register_buffer(buf_name, buf.to(device))
-
-
-class BlockSwapManager:
-    """Manages CPU/GPU block swapping for transformer layers.
-
-    Uses the LTX-style approach: only swap PARAMETERS (weights), keep
-    BUFFERS (like RoPE position embedding caches) on GPU at all times.
-    """
-
-    def __init__(self, model, num_gpu_blocks: int, device: torch.device):
-        self.model = model
-        self.num_gpu_blocks = num_gpu_blocks
-        self.device = device
-        self.cpu_device = torch.device("cpu")
-        self.total_blocks = 0
-        self.swapped_blocks = []
-        self.original_forwards = {}
-        self.buffers_initialized = False
-
-    def _ensure_all_buffers_on_gpu(self):
-        """Ensure ALL buffers in the backbone stay on GPU."""
-        if self.buffers_initialized:
-            return
-        backbone = self.model.backbone
-        # Move all buffers to GPU and keep them there
-        for name, buf in backbone.named_buffers(recurse=True):
-            if buf is not None and buf.device.type != 'cuda':
-                # Find the module that owns this buffer and update it
-                parts = name.rsplit('.', 1)
-                if len(parts) == 2:
-                    parent_name, buf_name = parts
-                    try:
-                        parent = backbone.get_submodule(parent_name)
-                        parent.register_buffer(buf_name, buf.to(self.device))
-                    except AttributeError:
-                        pass
-                else:
-                    backbone.register_buffer(name, buf.to(self.device))
-        self.buffers_initialized = True
-
-    def setup(self):
-        """Set up block swapping by wrapping forward methods."""
-        backbone = self.model.backbone
-
-        if not hasattr(backbone, 'layers'):
-            log("Warning: Cannot find 'layers' attribute for block swapping")
-            return False
-
-        self.total_blocks = len(backbone.layers)
-        blocks_to_swap = max(0, self.total_blocks - self.num_gpu_blocks)
-
-        if blocks_to_swap == 0:
-            log(f"All {self.total_blocks} blocks kept on GPU (no swapping needed)")
-            return True
-
-        log(f"Setting up block swapping: {self.num_gpu_blocks} on GPU, {blocks_to_swap} swapped to CPU")
-
-        # First, ensure ALL buffers (including RoPE cache) are on GPU
-        self._ensure_all_buffers_on_gpu()
-
-        # Move the LAST N blocks' PARAMETERS to CPU (they're used later in forward pass)
-        # Keep buffers on GPU!
-        swap_start_idx = self.num_gpu_blocks
-
-        for i in range(swap_start_idx, self.total_blocks):
-            layer = backbone.layers[i]
-
-            # Store original forward
-            self.original_forwards[i] = layer.forward
-
-            # Create wrapped forward that handles device transfer for PARAMETERS ONLY
-            def make_swapping_forward(layer_ref, orig_forward, idx, manager):
-                def swapping_forward(*args, **kwargs):
-                    # Move layer PARAMETERS to GPU (buffers already on GPU)
-                    _params_to_device(layer_ref, manager.device, non_blocking=False)
-                    if manager.device.type == 'cuda':
-                        torch.cuda.synchronize()
-
-                    # Run forward (all tensors should already be on GPU)
-                    result = orig_forward(*args, **kwargs)
-
-                    # Move layer PARAMETERS back to CPU
-                    _params_to_device(layer_ref, manager.cpu_device, non_blocking=True)
-
-                    return result
-                return swapping_forward
-
-            # Replace forward method
-            layer.forward = make_swapping_forward(layer, self.original_forwards[i], i, self)
-
-            # Move layer PARAMETERS to CPU, but keep buffers on GPU
-            _params_to_device(layer, self.cpu_device, non_blocking=False)
-            self.swapped_blocks.append(i)
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        log(f"Block swapping ready: blocks {swap_start_idx}-{self.total_blocks-1} will swap from CPU")
-        log(f"  (Buffers like RoPE cache remain on GPU)")
-        return True
-
-    def cleanup(self):
-        """Restore original forwards. Model will be moved to CPU separately during full cleanup."""
-        if hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'layers'):
-            for i, orig_forward in self.original_forwards.items():
-                self.model.backbone.layers[i].forward = orig_forward
-        self.original_forwards = {}
-        self.swapped_blocks = []
-        self.buffers_initialized = False
-
-    def restore_state(self):
-        """Restore block swapping state after model was moved to CPU.
-
-        This is needed when the model is offloaded to CPU during generation
-        (e.g., for codec detokenization) and needs to be restored for the
-        next generation in a batch.
-        """
-        if not self.swapped_blocks:
-            return
-
-        backbone = self.model.backbone
-
-        # Move non-swapped blocks (first N blocks) back to GPU
-        for i in range(self.num_gpu_blocks):
-            if i < len(backbone.layers):
-                backbone.layers[i].to(self.device)
-
-        # Move non-layer components back to GPU
-        self.model.text_embeddings.to(self.device)
-        self.model.audio_embeddings.to(self.device)
-        self.model.unconditional_text_embedding.to(self.device)
-        self.model.projection.to(self.device)
-        self.model.codebook0_head.to(self.device)
-        self.model.audio_head.data = self.model.audio_head.data.to(self.device)
-        self.model.muq_linear.to(self.device)
-        backbone.norm.to(self.device)
-        self.model.decoder.to(self.device)
-
-        # Swapped blocks should stay on CPU - move their params back to CPU
-        # (they may have been moved to GPU by model.to(device) in _forward)
-        for i in self.swapped_blocks:
-            _params_to_device(backbone.layers[i], self.cpu_device, non_blocking=False)
-
-        # Ensure all buffers are on GPU
-        self.buffers_initialized = False
-        self._ensure_all_buffers_on_gpu()
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    def get_memory_stats(self):
-        """Get current GPU memory usage."""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            return f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        return "CUDA not available"
-
-
 def log(message: str):
     """Log a message to the console."""
     print(message)
@@ -330,7 +147,7 @@ def generate_music(
     stop_event.clear()
 
     pipe = None
-    block_swap_manager = None
+    block_swap_enabled = False
     all_generated_music = []
     all_seeds = []
     batch_count = int(batch_count)
@@ -338,9 +155,7 @@ def generate_music(
 
     def cleanup():
         """Clean up GPU memory."""
-        nonlocal pipe, block_swap_manager
-        if block_swap_manager is not None:
-            block_swap_manager.cleanup()
+        nonlocal pipe
         if pipe is not None:
             if hasattr(pipe, 'model') and pipe.model is not None:
                 try:
@@ -488,16 +303,17 @@ def generate_music(
 
             # Only set up block swapping if some blocks need to stay on CPU
             if effective_gpu_blocks < total_blocks:
-                block_swap_manager = BlockSwapManager(pipe.model, effective_gpu_blocks, device)
-                if block_swap_manager.setup():
-                    blocks_swapped = total_blocks - effective_gpu_blocks
-                    log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_swapped} swap from CPU")
-                    log(block_swap_manager.get_memory_stats())
-                    # Prevent pipeline from moving entire model to GPU during generation
-                    pipe._skip_auto_move = True
-                else:
-                    block_swap_manager = None
-                    log("Block swapping setup failed, keeping partial GPU load")
+                blocks_to_swap = total_blocks - effective_gpu_blocks
+                pipe.model.enable_block_swap(blocks_to_swap, device)
+                pipe.model.prepare_block_swap_before_forward()
+                block_swap_enabled = True
+                log(f"Block swapping ready: {effective_gpu_blocks} on GPU, {blocks_to_swap} swap from CPU")
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    reserved = torch.cuda.memory_reserved() / 1024**3
+                    log(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                # Prevent pipeline from moving entire model to GPU during generation
+                pipe._skip_auto_move = True
             else:
                 log(f"All {total_blocks} blocks on GPU (no swapping needed)")
                 log(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
@@ -509,13 +325,14 @@ def generate_music(
             allocated = torch.cuda.memory_allocated() / 1024**3
             log(f"GPU Memory after model load: {allocated:.2f}GB")
 
-        # Optionally compile model for faster inference (reduces CPU overhead)
+        # Optionally compile model for faster inference
+        # Note: torch.compile now works with block swapping (WAN-style orchestration)
         if compile_model:
             try:
-                log("Compiling model with CUDA graphs (first run will be slower)...")
-                pipe.model.compile_model(mode="reduce-overhead")
+                log("Compiling model (first run will be slower)...")
+                pipe.model.compile_model(mode="max-autotune-no-cudagraphs")
             except (AssertionError, RuntimeError) as e:
-                log(f"Warning: CUDA graph compilation failed ({e}), running without compilation")
+                log(f"Warning: Compilation failed ({e}), running without compilation")
                 compile_model = False  # Disable for this run
 
         # Convert duration from seconds to milliseconds
@@ -640,8 +457,8 @@ def generate_music(
                 log(f"GPU Memory after song {i+1}: {allocated:.2f}GB")
 
             # Restore block swapping state for next generation in batch
-            if block_swap_manager is not None and i < batch_count - 1:
-                block_swap_manager.restore_state()
+            if block_swap_enabled and i < batch_count - 1:
+                pipe.model.prepare_block_swap_before_forward()
 
         # Final status
         final_status = f"Completed {batch_count} song(s)!" if batch_count > 1 else "Generation complete!"
