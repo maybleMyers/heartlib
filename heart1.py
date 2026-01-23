@@ -15,10 +15,15 @@ import threading
 import random
 import time
 import json
+import numpy as np
 from pathlib import Path
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from queue import Queue
 from datetime import datetime
+from scipy import signal
+from scipy.io import wavfile
+import soundfile as sf
+from pydub import AudioSegment
 
 # Defaults file path
 HEARTMULA_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "heartmula_defaults.json")
@@ -137,6 +142,8 @@ def generate_music(
     ref_audio_semantic: str = None,
     ref_audio_img2img: str = None,
     ref_strength: float = 0.5,
+    normalize_loudness: bool = True,
+    loudness_boost: float = 1.0,
     num_steps: int = 10,
     ref_audio_sec: float = 10.0,
 ):
@@ -409,6 +416,8 @@ def generate_music(
                     "ref_audio_semantic": ref_audio_semantic if ref_audio_semantic and os.path.isfile(ref_audio_semantic) else "",
                     "ref_audio_img2img": ref_audio_img2img if ref_audio_img2img and os.path.isfile(ref_audio_img2img) else "",
                     "ref_strength": ref_strength,
+                    "normalize_loudness": normalize_loudness,
+                    "loudness_boost": loudness_boost,
                     "ref_audio_sec": ref_audio_sec if ref_audio_semantic and os.path.isfile(ref_audio_semantic) else 0,
                     "compile_model": compile_model,
                     "use_rl_models": use_rl_models,
@@ -432,6 +441,8 @@ def generate_music(
                 if ref_audio_img2img and os.path.isfile(ref_audio_img2img):
                     pipe_kwargs["ref_audio"] = ref_audio_img2img
                     pipe_kwargs["ref_strength"] = ref_strength
+                    pipe_kwargs["normalize_loudness"] = normalize_loudness
+                    pipe_kwargs["loudness_boost"] = loudness_boost
 
                 try:
                     pipe(
@@ -490,6 +501,291 @@ def generate_music(
         yield (*create_audio_outputs(all_generated_music, labels), error_msg)
     finally:
         cleanup()
+
+
+# Post-processing functions
+def save_audio_as_mp3(data, sr, is_stereo):
+    """Save audio data as MP3 file and return the path."""
+    # Save as temporary WAV first
+    temp_wav = tempfile.mktemp(suffix=".wav")
+    if not is_stereo:
+        data = data.flatten()
+    sf.write(temp_wav, data, sr)
+
+    # Convert to MP3
+    output_path = tempfile.mktemp(suffix=".mp3")
+    audio = AudioSegment.from_wav(temp_wav)
+    audio.export(output_path, format="mp3", bitrate="192k")
+
+    # Clean up temp WAV
+    os.remove(temp_wav)
+
+    return output_path
+
+
+def load_audio_for_processing(audio_path):
+    """Load audio file and return sample rate and data."""
+    if audio_path is None:
+        return None, None, "No audio file provided."
+
+    try:
+        data, sr = sf.read(audio_path)
+        # Convert to mono if stereo for simpler processing, then back to stereo
+        if len(data.shape) > 1:
+            is_stereo = True
+        else:
+            is_stereo = False
+            data = data.reshape(-1, 1)
+
+        duration = len(data) / sr
+        return (sr, data, is_stereo), None, f"Loaded: {os.path.basename(audio_path)} ({duration:.2f}s, {sr}Hz)"
+    except Exception as e:
+        return None, None, f"Error loading audio: {e}"
+
+
+def trim_audio(audio_state, start_time, end_time):
+    """Trim audio between two time points."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+    duration = len(data) / sr
+
+    # Validate times
+    if start_time < 0:
+        start_time = 0
+    if end_time > duration:
+        end_time = duration
+    if start_time >= end_time:
+        return None, f"Invalid time range: start ({start_time:.2f}s) must be less than end ({end_time:.2f}s)"
+
+    # Convert times to sample indices
+    start_sample = int(start_time * sr)
+    end_sample = int(end_time * sr)
+
+    # Trim
+    trimmed_data = data[start_sample:end_sample]
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(trimmed_data, sr, is_stereo)
+
+    new_duration = len(trimmed_data) / sr
+    return output_path, f"Trimmed: {start_time:.2f}s to {end_time:.2f}s (new duration: {new_duration:.2f}s)"
+
+
+def adjust_loudness(audio_state, gain_db):
+    """Adjust audio loudness by a gain in dB."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    # Convert dB to linear gain
+    linear_gain = 10 ** (gain_db / 20)
+
+    # Apply gain
+    adjusted_data = data * linear_gain
+
+    # Clip to prevent distortion
+    adjusted_data = np.clip(adjusted_data, -1.0, 1.0)
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(adjusted_data, sr, is_stereo)
+
+    return output_path, f"Loudness adjusted by {gain_db:+.1f} dB"
+
+
+def apply_bass_boost(audio_state, boost_db, cutoff_freq):
+    """Apply bass boost using a low-shelf filter."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    # Measure original RMS loudness
+    original_rms = np.sqrt(np.mean(data ** 2))
+
+    # Design a low-shelf filter for bass boost
+    # Using a simple approach: boost frequencies below cutoff
+    nyquist = sr / 2
+    normalized_cutoff = cutoff_freq / nyquist
+
+    if normalized_cutoff >= 1.0:
+        normalized_cutoff = 0.99
+
+    # Create a low-pass filter for the bass frequencies
+    b_low, a_low = signal.butter(2, normalized_cutoff, btype='low')
+
+    # Convert dB to linear gain
+    bass_gain = 10 ** (boost_db / 20)
+
+    # Process each channel
+    result_data = np.zeros_like(data)
+    for ch in range(data.shape[1]):
+        channel = data[:, ch]
+        # Extract bass frequencies
+        bass = signal.filtfilt(b_low, a_low, channel)
+        # Boost bass and add back
+        result_data[:, ch] = channel + bass * (bass_gain - 1)
+
+    # Restore original loudness level
+    new_rms = np.sqrt(np.mean(result_data ** 2))
+    if new_rms > 0:
+        result_data = result_data * (original_rms / new_rms)
+
+    # Soft clip to prevent harsh distortion while preserving loudness
+    result_data = np.tanh(result_data)
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+
+    return output_path, f"Bass boost: {boost_db:+.1f} dB below {cutoff_freq} Hz"
+
+
+def apply_treble_boost(audio_state, boost_db, cutoff_freq):
+    """Apply treble boost using a high-shelf filter."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    # Measure original RMS loudness
+    original_rms = np.sqrt(np.mean(data ** 2))
+
+    nyquist = sr / 2
+    normalized_cutoff = cutoff_freq / nyquist
+
+    if normalized_cutoff >= 1.0:
+        normalized_cutoff = 0.99
+
+    # Create a high-pass filter for treble frequencies
+    b_high, a_high = signal.butter(2, normalized_cutoff, btype='high')
+
+    # Convert dB to linear gain
+    treble_gain = 10 ** (boost_db / 20)
+
+    # Process each channel
+    result_data = np.zeros_like(data)
+    for ch in range(data.shape[1]):
+        channel = data[:, ch]
+        # Extract treble frequencies
+        treble = signal.filtfilt(b_high, a_high, channel)
+        # Boost treble and add back
+        result_data[:, ch] = channel + treble * (treble_gain - 1)
+
+    # Restore original loudness level
+    new_rms = np.sqrt(np.mean(result_data ** 2))
+    if new_rms > 0:
+        result_data = result_data * (original_rms / new_rms)
+
+    # Soft clip to prevent harsh distortion
+    result_data = np.tanh(result_data)
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+
+    return output_path, f"Treble boost: {boost_db:+.1f} dB above {cutoff_freq} Hz"
+
+
+def normalize_audio(audio_state, target_db):
+    """Normalize audio to a target peak level in dB."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    # Find current peak
+    current_peak = np.max(np.abs(data))
+    if current_peak == 0:
+        return None, "Audio is silent, cannot normalize."
+
+    current_db = 20 * np.log10(current_peak)
+
+    # Calculate required gain
+    gain_db = target_db - current_db
+    linear_gain = 10 ** (gain_db / 20)
+
+    # Apply gain
+    normalized_data = data * linear_gain
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(normalized_data, sr, is_stereo)
+
+    return output_path, f"Normalized to {target_db:.1f} dB (gain: {gain_db:+.1f} dB)"
+
+
+def apply_fade_in(audio_state, fade_duration):
+    """Apply fade-in effect."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    fade_samples = int(fade_duration * sr)
+    if fade_samples > len(data):
+        fade_samples = len(data)
+
+    # Create fade curve
+    fade_curve = np.linspace(0, 1, fade_samples)
+
+    # Apply fade to each channel
+    result_data = data.copy()
+    for ch in range(data.shape[1]):
+        result_data[:fade_samples, ch] = data[:fade_samples, ch] * fade_curve
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+
+    return output_path, f"Fade-in applied: {fade_duration:.2f}s"
+
+
+def apply_fade_out(audio_state, fade_duration):
+    """Apply fade-out effect."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    fade_samples = int(fade_duration * sr)
+    if fade_samples > len(data):
+        fade_samples = len(data)
+
+    # Create fade curve
+    fade_curve = np.linspace(1, 0, fade_samples)
+
+    # Apply fade to each channel
+    result_data = data.copy()
+    for ch in range(data.shape[1]):
+        result_data[-fade_samples:, ch] = data[-fade_samples:, ch] * fade_curve
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+
+    return output_path, f"Fade-out applied: {fade_duration:.2f}s"
+
+
+def change_speed(audio_state, speed_factor):
+    """Change audio playback speed (affects pitch)."""
+    if audio_state is None:
+        return None, "No audio loaded. Please load an audio file first."
+
+    sr, data, is_stereo = audio_state
+
+    if speed_factor <= 0:
+        return None, "Speed factor must be positive."
+
+    # Resample to change speed
+    new_length = int(len(data) / speed_factor)
+
+    result_data = np.zeros((new_length, data.shape[1]))
+    for ch in range(data.shape[1]):
+        result_data[:, ch] = signal.resample(data[:, ch], new_length)
+
+    # Save as MP3
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+
+    new_duration = new_length / sr
+    return output_path, f"Speed changed to {speed_factor:.2f}x (new duration: {new_duration:.2f}s)"
 
 
 # Build the Gradio interface
@@ -579,7 +875,20 @@ with gr.Blocks(
                             minimum=0.0,
                             maximum=1.0,
                             value=0.5,
-                            step=0.05,
+                            step=0.01,
+                        )
+                        normalize_loudness_checkbox = gr.Checkbox(
+                            label="Normalize Loudness",
+                            value=True,
+                            info="Match output loudness to reference audio"
+                        )
+                        loudness_boost_slider = gr.Slider(
+                            label="Loudness Boost",
+                            minimum=0.1,
+                            maximum=10.0,
+                            value=1.0,
+                            step=0.1,
+                            info="Multiply output volume (1.0 = no change)"
                         )
                         num_steps_slider = gr.Slider(
                             label="Flow Matching Steps (more = higher quality, slower)",
@@ -735,6 +1044,131 @@ with gr.Blocks(
                             info_model_path = gr.Textbox(label="Model Path", interactive=False)
                             info_generated_at = gr.Textbox(label="Generated At", interactive=False)
 
+        # Post-Processing Tab
+        with gr.Tab("Post-Processing"):
+            gr.Markdown("### Audio Post-Processing")
+            gr.Markdown("Load an audio file and apply various effects. Changes are cumulative - load the output to apply more effects.")
+
+            # State to hold the loaded audio data
+            pp_audio_state = gr.State(value=None)
+
+            with gr.Row():
+                # Left column - Input and Controls
+                with gr.Column(scale=1):
+                    with gr.Accordion("Input Audio", open=True):
+                        pp_audio_input = gr.Audio(
+                            label="Load Audio File",
+                            type="filepath",
+                        )
+                        pp_load_btn = gr.Button("📂 Load Audio", variant="primary")
+                        pp_load_status = gr.Textbox(label="Status", interactive=False, value="", lines=2)
+
+                    with gr.Accordion("Trim / Cut", open=True):
+                        gr.Markdown("*Cut the audio between two time points*")
+                        with gr.Row():
+                            pp_trim_start = gr.Number(label="Start Time (s)", value=0, minimum=0)
+                            pp_trim_end = gr.Number(label="End Time (s)", value=30, minimum=0)
+                        pp_trim_btn = gr.Button("✂️ Trim Audio")
+
+                    with gr.Accordion("Loudness", open=True):
+                        pp_gain_db = gr.Slider(
+                            label="Gain (dB)",
+                            minimum=-20,
+                            maximum=20,
+                            value=0,
+                            step=0.5,
+                            info="Positive = louder, Negative = quieter"
+                        )
+                        pp_loudness_btn = gr.Button("🔊 Adjust Loudness")
+
+                        gr.Markdown("---")
+                        pp_normalize_db = gr.Slider(
+                            label="Target Peak Level (dB)",
+                            minimum=-12,
+                            maximum=0,
+                            value=-1,
+                            step=0.5,
+                            info="Normalize peak to this level"
+                        )
+                        pp_normalize_btn = gr.Button("📊 Normalize")
+
+                    with gr.Accordion("EQ / Tone", open=True):
+                        gr.Markdown("**Bass Boost**")
+                        with gr.Row():
+                            pp_bass_boost_db = gr.Slider(
+                                label="Boost (dB)",
+                                minimum=0,
+                                maximum=12,
+                                value=6,
+                                step=0.5
+                            )
+                            pp_bass_cutoff = gr.Slider(
+                                label="Cutoff (Hz)",
+                                minimum=60,
+                                maximum=300,
+                                value=150,
+                                step=10
+                            )
+                        pp_bass_btn = gr.Button("🔉 Apply Bass Boost")
+
+                        gr.Markdown("**Treble Boost**")
+                        with gr.Row():
+                            pp_treble_boost_db = gr.Slider(
+                                label="Boost (dB)",
+                                minimum=0,
+                                maximum=12,
+                                value=6,
+                                step=0.5
+                            )
+                            pp_treble_cutoff = gr.Slider(
+                                label="Cutoff (Hz)",
+                                minimum=2000,
+                                maximum=10000,
+                                value=4000,
+                                step=100
+                            )
+                        pp_treble_btn = gr.Button("🔊 Apply Treble Boost")
+
+                    with gr.Accordion("Fades", open=True):
+                        with gr.Row():
+                            pp_fade_in_duration = gr.Slider(
+                                label="Fade-In Duration (s)",
+                                minimum=0,
+                                maximum=10,
+                                value=2,
+                                step=0.1
+                            )
+                            pp_fade_in_btn = gr.Button("📈 Fade In")
+                        with gr.Row():
+                            pp_fade_out_duration = gr.Slider(
+                                label="Fade-Out Duration (s)",
+                                minimum=0,
+                                maximum=10,
+                                value=2,
+                                step=0.1
+                            )
+                            pp_fade_out_btn = gr.Button("📉 Fade Out")
+
+                    with gr.Accordion("Speed", open=True):
+                        pp_speed_factor = gr.Slider(
+                            label="Speed Factor",
+                            minimum=0.5,
+                            maximum=2.0,
+                            value=1.0,
+                            step=0.05,
+                            info="<1 = slower, >1 = faster (affects pitch)"
+                        )
+                        pp_speed_btn = gr.Button("⏩ Change Speed")
+
+                # Right column - Output
+                with gr.Column(scale=1):
+                    with gr.Accordion("Output", open=True):
+                        pp_output_audio = gr.Audio(
+                            label="Processed Audio",
+                            interactive=False,
+                        )
+                        pp_output_status = gr.Textbox(label="Processing Status", interactive=False, value="", lines=2)
+
     # Event handlers
     def update_blocks_slider(version):
         max_blocks = MODEL_LAYER_COUNTS.get(version, {}).get("backbone", 28)
@@ -759,7 +1193,7 @@ with gr.Blocks(
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
                 batch_count, seed, output_folder, compile_checkbox, use_rl_models_checkbox,
-                ref_audio_semantic, ref_audio_img2img, ref_strength_slider,
+                ref_audio_semantic, ref_audio_img2img, ref_strength_slider, normalize_loudness_checkbox, loudness_boost_slider,
                 num_steps_slider, ref_audio_sec_slider],
         outputs=audio_outputs + [status_text]
     )
@@ -776,7 +1210,7 @@ with gr.Blocks(
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
         max_duration, temperature, topk, cfg_scale, compile_checkbox, use_rl_models_checkbox,
-        num_steps_slider, ref_strength_slider, ref_audio_sec_slider
+        num_steps_slider, ref_strength_slider, normalize_loudness_checkbox, loudness_boost_slider, ref_audio_sec_slider
     ]
 
     # Keys for the defaults file (must match order of components)
@@ -784,7 +1218,7 @@ with gr.Blocks(
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
         "max_duration", "temperature", "topk", "cfg_scale", "compile_model", "use_rl_models",
-        "num_steps", "ref_strength", "ref_audio_sec"
+        "num_steps", "ref_strength", "normalize_loudness", "loudness_boost", "ref_audio_sec"
     ]
 
     def save_defaults(*values):
@@ -893,12 +1327,12 @@ with gr.Blocks(
     def send_settings_to_generation(metadata):
         """Send loaded metadata settings to the generation tab."""
         if metadata is None:
-            return [gr.update()] * 19 + ["No metadata loaded. Please upload an MP3 first."]
+            return [gr.update()] * 21 + ["No metadata loaded. Please upload an MP3 first."]
 
         # Map metadata to generation tab components
         # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
         # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        # max_duration, temperature, topk, cfg_scale, compile_model, use_rl_models, num_steps, ref_strength, ref_audio_sec
+        # max_duration, temperature, topk, cfg_scale, compile_model, use_rl_models, num_steps, ref_strength, normalize_loudness, loudness_boost, ref_audio_sec
         updates = [
             gr.update(value=metadata.get("lyrics", "")),
             gr.update(value=metadata.get("tags", "")),
@@ -918,6 +1352,8 @@ with gr.Blocks(
             gr.update(value=metadata.get("use_rl_models", False)),
             gr.update(value=metadata.get("num_steps", 10)),
             gr.update(value=metadata.get("ref_strength", 0.5)),
+            gr.update(value=metadata.get("normalize_loudness", True)),
+            gr.update(value=metadata.get("loudness_boost", 1.0)),
             gr.update(value=metadata.get("ref_audio_sec", 30)),
         ]
 
@@ -949,6 +1385,61 @@ with gr.Blocks(
         fn=send_settings_to_generation,
         inputs=[loaded_metadata_state],
         outputs=defaults_components + [audio_info_status]
+    )
+
+    # Post-Processing Tab event handlers
+    pp_load_btn.click(
+        fn=load_audio_for_processing,
+        inputs=[pp_audio_input],
+        outputs=[pp_audio_state, pp_output_audio, pp_load_status]
+    )
+
+    pp_trim_btn.click(
+        fn=trim_audio,
+        inputs=[pp_audio_state, pp_trim_start, pp_trim_end],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_loudness_btn.click(
+        fn=adjust_loudness,
+        inputs=[pp_audio_state, pp_gain_db],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_normalize_btn.click(
+        fn=normalize_audio,
+        inputs=[pp_audio_state, pp_normalize_db],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_bass_btn.click(
+        fn=apply_bass_boost,
+        inputs=[pp_audio_state, pp_bass_boost_db, pp_bass_cutoff],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_treble_btn.click(
+        fn=apply_treble_boost,
+        inputs=[pp_audio_state, pp_treble_boost_db, pp_treble_cutoff],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_fade_in_btn.click(
+        fn=apply_fade_in,
+        inputs=[pp_audio_state, pp_fade_in_duration],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_fade_out_btn.click(
+        fn=apply_fade_out,
+        inputs=[pp_audio_state, pp_fade_out_duration],
+        outputs=[pp_output_audio, pp_output_status]
+    )
+
+    pp_speed_btn.click(
+        fn=change_speed,
+        inputs=[pp_audio_state, pp_speed_factor],
+        outputs=[pp_output_audio, pp_output_status]
     )
 
     # Auto-load defaults on startup

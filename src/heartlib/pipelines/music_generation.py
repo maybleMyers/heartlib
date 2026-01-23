@@ -552,11 +552,13 @@ class HeartMuLaGenPipeline(Pipeline):
         save_path: str = postprocess_parameters.get("save_path", "output.mp3")
         codes_path: Optional[str] = postprocess_parameters.get("codes_path", None)
         metadata: Optional[Dict[str, Any]] = postprocess_parameters.get("metadata", None)
+        normalize_loudness: bool = postprocess_parameters.get("normalize_loudness", True)
+        loudness_boost: float = postprocess_parameters.get("loudness_boost", 1.0)
         wav = model_outputs["wav"]
         ref_audio_path = model_outputs.get("ref_audio_path", None)
 
         # Normalize img2img output to match reference audio loudness
-        if ref_audio_path is not None:
+        if ref_audio_path is not None and normalize_loudness:
             ref_wav, ref_sr = torchaudio.load(ref_audio_path)
             # Resample if needed
             if ref_sr != 48000:
@@ -569,6 +571,11 @@ class HeartMuLaGenPipeline(Pipeline):
             # Scale output to match reference RMS
             if out_rms > 0:
                 wav = wav * (ref_rms / out_rms)
+
+        # Apply loudness boost
+        if loudness_boost != 1.0:
+            wav = wav * loudness_boost
+            wav = wav.clamp(-1.0, 1.0)
 
         # Determine format from extension
         if save_path.lower().endswith('.mp3'):
