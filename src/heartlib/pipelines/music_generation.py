@@ -552,11 +552,13 @@ class HeartMuLaGenPipeline(Pipeline):
         save_path: str = postprocess_parameters.get("save_path", "output.mp3")
         codes_path: Optional[str] = postprocess_parameters.get("codes_path", None)
         metadata: Optional[Dict[str, Any]] = postprocess_parameters.get("metadata", None)
+        normalize_loudness: bool = postprocess_parameters.get("normalize_loudness", True)
+        loudness_boost: float = postprocess_parameters.get("loudness_boost", 1.0)
         wav = model_outputs["wav"]
         ref_audio_path = model_outputs.get("ref_audio_path", None)
 
         # Normalize img2img output to match reference audio loudness
-        if ref_audio_path is not None:
+        if ref_audio_path is not None and normalize_loudness:
             ref_wav, ref_sr = torchaudio.load(ref_audio_path)
             # Resample if needed
             if ref_sr != 48000:
@@ -569,6 +571,11 @@ class HeartMuLaGenPipeline(Pipeline):
             # Scale output to match reference RMS
             if out_rms > 0:
                 wav = wav * (ref_rms / out_rms)
+
+        # Apply loudness boost
+        if loudness_boost != 1.0:
+            wav = wav * loudness_boost
+            wav = wav.clamp(-1.0, 1.0)
 
         # Determine format from extension
         if save_path.lower().endswith('.mp3'):
@@ -699,9 +706,18 @@ class HeartMuLaGenPipeline(Pipeline):
         muq_model_id: Optional[str] = None,
         muq_cache_dir: Optional[str] = None,
         muq_revision: Optional[str] = None,
+        use_rl_models: bool = False,
     ):
+        # Select model directories based on use_rl_models flag
+        if use_rl_models:
+            heartcodec_dir = "HeartCodec-oss-20260123"
+            heartmula_dir = f"HeartMuLa-RL-oss-{version}-20260123"
+        else:
+            heartcodec_dir = "HeartCodec-oss"
+            heartmula_dir = f"HeartMuLa-oss-{version}"
+
         if os.path.exists(
-            heartcodec_path := os.path.join(pretrained_path, "HeartCodec-oss")
+            heartcodec_path := os.path.join(pretrained_path, heartcodec_dir)
         ):
             # Load HeartCodec on CPU if skip_model_move (will be moved to GPU for detokenization)
             codec_device = "cpu" if skip_model_move else device
@@ -712,7 +728,7 @@ class HeartMuLaGenPipeline(Pipeline):
             )
 
         if os.path.exists(
-            heartmula_path := os.path.join(pretrained_path, f"HeartMuLa-oss-{version}")
+            heartmula_path := os.path.join(pretrained_path, heartmula_dir)
         ):
             heartmula = HeartMuLa.from_pretrained(
                 heartmula_path, dtype=dtype, quantization_config=bnb_config
