@@ -699,9 +699,18 @@ class HeartMuLaGenPipeline(Pipeline):
         muq_model_id: Optional[str] = None,
         muq_cache_dir: Optional[str] = None,
         muq_revision: Optional[str] = None,
+        use_rl_models: bool = False,
     ):
+        # Select model directories based on use_rl_models flag
+        if use_rl_models:
+            heartcodec_dir = "HeartCodec-oss-20260123"
+            heartmula_dir = f"HeartMuLa-RL-oss-{version}-20260123"
+        else:
+            heartcodec_dir = "HeartCodec-oss"
+            heartmula_dir = f"HeartMuLa-oss-{version}"
+
         if os.path.exists(
-            heartcodec_path := os.path.join(pretrained_path, "HeartCodec-oss")
+            heartcodec_path := os.path.join(pretrained_path, heartcodec_dir)
         ):
             # Load HeartCodec on CPU if skip_model_move (will be moved to GPU for detokenization)
             codec_device = "cpu" if skip_model_move else device
@@ -712,7 +721,7 @@ class HeartMuLaGenPipeline(Pipeline):
             )
 
         if os.path.exists(
-            heartmula_path := os.path.join(pretrained_path, f"HeartMuLa-oss-{version}")
+            heartmula_path := os.path.join(pretrained_path, heartmula_dir)
         ):
             heartmula = HeartMuLa.from_pretrained(
                 heartmula_path, dtype=dtype, quantization_config=bnb_config

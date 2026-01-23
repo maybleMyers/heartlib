@@ -133,6 +133,7 @@ def generate_music(
     seed: int,
     output_folder: str,
     compile_model: bool = False,
+    use_rl_models: bool = False,
     ref_audio_semantic: str = None,
     ref_audio_img2img: str = None,
     ref_strength: float = 0.5,
@@ -252,7 +253,8 @@ def generate_music(
         if not torch.cuda.is_available():
             dtype = torch.float32
 
-        log(f"Loading HeartMuLa-{model_version} from {model_path}...")
+        model_variant = "RL-20260123" if use_rl_models else "standard"
+        log(f"Loading HeartMuLa-{model_version} ({model_variant}) from {model_path}...")
         log(f"Using device: {device}, dtype: {dtype}")
 
         # Get total blocks for this model version
@@ -278,6 +280,7 @@ def generate_music(
             version=model_version,
             skip_model_move=use_selective_loading,
             load_muq_mulan=should_load_muq,
+            use_rl_models=use_rl_models,
         )
 
         # Set up selective loading for better memory management
@@ -342,6 +345,7 @@ def generate_music(
         for i in range(batch_count):
             if stop_event.is_set():
                 log("Generation stopped by user.")
+                cleanup()  # Explicitly free GPU memory before returning
                 labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
                 yield (*create_audio_outputs(all_generated_music, labels), "Stopped by user.")
                 return
@@ -407,6 +411,7 @@ def generate_music(
                     "ref_strength": ref_strength,
                     "ref_audio_sec": ref_audio_sec if ref_audio_semantic and os.path.isfile(ref_audio_semantic) else 0,
                     "compile_model": compile_model,
+                    "use_rl_models": use_rl_models,
                     "generated_at": datetime.now().isoformat(),
                 }
 
@@ -420,6 +425,7 @@ def generate_music(
                     "num_steps": num_steps,
                     "negative_prompt": negative_prompt if negative_prompt.strip() else None,
                     "metadata": generation_metadata,
+                    "stop_check": lambda: stop_event.is_set(),
                 }
 
                 # Add img2img reference if provided
@@ -440,6 +446,14 @@ def generate_music(
                             "in the Model Settings, or restart the application."
                         ) from e
                     raise
+
+                # Check if stop was triggered during generation
+                if stop_event.is_set():
+                    log("Generation stopped by user.")
+                    cleanup()  # Explicitly free GPU memory before returning
+                    labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
+                    yield (*create_audio_outputs(all_generated_music, labels), "Stopped by user.")
+                    return
 
             elapsed = time.perf_counter() - start_time
             log(f"Song {i+1} complete! ({elapsed:.1f}s)")
@@ -624,6 +638,11 @@ with gr.Blocks(
                                 value=False,
                                 info="Faster inference. First run compiles and will be slower."
                             )
+                            use_rl_models_checkbox = gr.Checkbox(
+                                label="Use 20260123 Models",
+                                value=False,
+                                info="Use HeartCodec-oss-20260123 and HeartMuLa-RL-oss-3B-20260123"
+                            )
 
                     with gr.Accordion("Generation Parameters", open=True):
                         max_duration = gr.Slider(
@@ -735,11 +754,11 @@ with gr.Blocks(
         outputs=[seed]
     )
 
-    generate_btn.click(
+    generate_event = generate_btn.click(
         fn=generate_music,
         inputs=[lyrics_input, tags_input, negative_prompt_input, max_duration, temperature, topk, cfg_scale,
                 model_path, model_version, num_gpu_blocks, model_dtype,
-                batch_count, seed, output_folder, compile_checkbox,
+                batch_count, seed, output_folder, compile_checkbox, use_rl_models_checkbox,
                 ref_audio_semantic, ref_audio_img2img, ref_strength_slider,
                 num_steps_slider, ref_audio_sec_slider],
         outputs=audio_outputs + [status_text]
@@ -747,7 +766,8 @@ with gr.Blocks(
 
     stop_btn.click(
         fn=stop_generation,
-        outputs=[status_text]
+        outputs=[status_text],
+        cancels=[generate_event]
     )
 
     # Save/Load Defaults
@@ -755,7 +775,7 @@ with gr.Blocks(
     defaults_components = [
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        max_duration, temperature, topk, cfg_scale, compile_checkbox,
+        max_duration, temperature, topk, cfg_scale, compile_checkbox, use_rl_models_checkbox,
         num_steps_slider, ref_strength_slider, ref_audio_sec_slider
     ]
 
@@ -763,7 +783,7 @@ with gr.Blocks(
     defaults_keys = [
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
-        "max_duration", "temperature", "topk", "cfg_scale", "compile_model",
+        "max_duration", "temperature", "topk", "cfg_scale", "compile_model", "use_rl_models",
         "num_steps", "ref_strength", "ref_audio_sec"
     ]
 
@@ -873,12 +893,12 @@ with gr.Blocks(
     def send_settings_to_generation(metadata):
         """Send loaded metadata settings to the generation tab."""
         if metadata is None:
-            return [gr.update()] * 18 + ["No metadata loaded. Please upload an MP3 first."]
+            return [gr.update()] * 19 + ["No metadata loaded. Please upload an MP3 first."]
 
         # Map metadata to generation tab components
         # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
         # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        # max_duration, temperature, topk, cfg_scale, compile_model, num_steps, ref_strength, ref_audio_sec
+        # max_duration, temperature, topk, cfg_scale, compile_model, use_rl_models, num_steps, ref_strength, ref_audio_sec
         updates = [
             gr.update(value=metadata.get("lyrics", "")),
             gr.update(value=metadata.get("tags", "")),
@@ -895,6 +915,7 @@ with gr.Blocks(
             gr.update(value=metadata.get("topk", 50)),
             gr.update(value=metadata.get("cfg_scale", 1.5)),
             gr.update(value=metadata.get("compile_model", False)),
+            gr.update(value=metadata.get("use_rl_models", False)),
             gr.update(value=metadata.get("num_steps", 10)),
             gr.update(value=metadata.get("ref_strength", 0.5)),
             gr.update(value=metadata.get("ref_audio_sec", 30)),
