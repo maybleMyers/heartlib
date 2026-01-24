@@ -387,11 +387,10 @@ class LmModel(StreamingModule):
         assert [x == possible_num_samples[0] for x in possible_num_samples], "Inconsistent inputs shapes"
         num_samples = possible_num_samples[0]
         condition_tensors = self.prepare_condition_tensors(batch_size=1, text=texts, descriptions=descriptions, audio_qt_emb=audio_qt_embs, prepare_null_condition=True)
-        # 3) Prepare token pool
+        # 3) Prepare token pool - pre-allocate tensor for GPU efficiency
         record_token_pool = None
-        if record_tokens:
-            record_token_pool = []
-            
+        token_pool_idx = 0
+
         # 4) set up startoff patterns
         start_offset = 0
         assert start_offset < max_gen_len, f"{start_offset}, {max_gen_len}"
@@ -415,8 +414,16 @@ class LmModel(StreamingModule):
         # 5) auto-regressive sampling
         with self.streaming():
             gen_sequence_len = gen_sequence.shape[-1]  # gen_sequence shape is [B, K, S]
+            total_steps = gen_sequence_len - start_offset_sequence
+
+            # Pre-allocate token pool tensor for GPU efficiency
+            if record_tokens:
+                record_token_pool = torch.zeros((self.code_depth, gen_sequence_len),
+                                                dtype=torch.long, device=device)
+
             prev_offset = 0
-            for offset in tqdm(range(start_offset_sequence, gen_sequence_len)):
+            pbar = tqdm(total=total_steps, desc="Generating", mininterval=2.0)
+            for step_idx, offset in enumerate(range(start_offset_sequence, gen_sequence_len)):
                 # get current sequence (note that the streaming API is providing the caching over previous offsets)
                 curr_sequence = gen_sequence[..., prev_offset:offset]
                 curr_mask = mask[None, ..., prev_offset:offset].expand(B, -1, -1)
@@ -426,10 +433,16 @@ class LmModel(StreamingModule):
                     # should never happen as gen_sequence is filled progressively
                     assert not (curr_sequence == unknown_token).any()
                 # sample next token from the model, next token shape is [B, K, 1]
+                # Pass tensor slice for GPU-side repetition penalty
+                if record_tokens and token_pool_idx > 0:
+                    window_start = max(0, token_pool_idx - record_window)
+                    token_pool_slice = record_token_pool[:, window_start:token_pool_idx]
+                else:
+                    token_pool_slice = None
                 next_token = self._sample_next_token(
                     curr_sequence, condition_tensors, use_sampling, temp, top_k, top_p,
-                    cfg_coef=cfg_coef, 
-                    sampled_token_pool=record_token_pool[-record_window:] if record_tokens else None,
+                    cfg_coef=cfg_coef,
+                    sampled_token_pool=token_pool_slice,
                     ignore_tokens = ignore_tokens
                     )
                 # ensure the tokens that should be masked are properly set to special_token_id
@@ -445,13 +458,25 @@ class LmModel(StreamingModule):
                     gen_sequence[..., offset:offset+1] == unknown_token,
                     next_token, gen_sequence[..., offset:offset+1])
                 
-                # record sampled tokens in a window
+                # record sampled tokens in pre-allocated tensor
                 if record_tokens:
-                    record_token_pool.append(next_token.squeeze())
+                    record_token_pool[:, token_pool_idx] = next_token.squeeze()
+                    token_pool_idx += 1
+
+                # Update progress every 25 steps and yield for GUI
+                if step_idx % 25 == 0:
+                    pbar.update(25 if step_idx > 0 else 1)
+                    pbar.set_postfix({"step": f"{step_idx}/{total_steps}"})
+                    yield ("progress", step_idx, total_steps)
+
                 if torch.all(is_end):
                     gen_sequence = gen_sequence[..., :offset+1]
                     break
                 prev_offset = offset
+
+            # Close progress bar
+            pbar.update(total_steps - pbar.n)
+            pbar.close()
                 
         # ensure sequence has been entirely filled
         assert not (gen_sequence == unknown_token).any()
@@ -469,8 +494,8 @@ class LmModel(StreamingModule):
         assert (out_mask == 1).all()
         # ensure the returned codes are all valid
         assert (out_codes >= 0).all() and (out_codes <= self.code_size).all()
-        return out_codes      
-    
+        yield ("result", out_codes)
+
     def _sample_next_token(self,
                            sequence: torch.Tensor,
                            condition_tensors: ConditionTensors,
@@ -479,7 +504,7 @@ class LmModel(StreamingModule):
                            top_k: int = 0,
                            top_p: float = 0.0,
                            cfg_coef: tp.Optional[float] = None,
-                           sampled_token_pool: tp.Optional[list] = None,
+                           sampled_token_pool: tp.Optional[torch.Tensor] = None,
                            ignore_tokens: tp.Optional[torch.tensor] = torch.tensor([])) -> torch.Tensor:
         """Sample next token from the model given a sequence and a set of conditions. The model supports
         multiple sampling strategies (greedy sampling, softmax, top-k, top-p...).
@@ -512,14 +537,19 @@ class LmModel(StreamingModule):
         logits = logits.permute(0, 1, 3, 2)  # [B, K, card, T]
         logits = logits[..., -1]  # [B x K x card]
         
-        # add punishment to pre-sampled tokens
-        if sampled_token_pool is not None and len(sampled_token_pool) > 0:
-            sampled_token_pool = torch.stack(sampled_token_pool, -1) # [K, T]
+        # add punishment to pre-sampled tokens (GPU-optimized)
+        # sampled_token_pool is already a tensor [K, window_size] from pre-allocated pool
+        if sampled_token_pool is not None and sampled_token_pool.shape[1] > 0:
             for q in range(self.code_depth):
-                # q_count = torch.bincount(sampled_token_pool)
-                q_count = torch.bincount(torch.unique(sampled_token_pool[q]))
-                tmp = min(q_count.shape[-1], self.code_size - 1) 
-                logits[:, q, :tmp] /= (1.1 ** q_count[:tmp])
+                # Get unique tokens that appeared in the window for this codebook
+                unique_tokens = torch.unique(sampled_token_pool[q])
+                # Filter to valid token range
+                unique_tokens = unique_tokens[unique_tokens < self.code_size - 1]
+                # Create penalty tensor: 1.0 for tokens that didn't appear, 1.1 for those that did
+                penalty = torch.ones(self.code_size, device=logits.device, dtype=logits.dtype)
+                if unique_tokens.numel() > 0:
+                    penalty[unique_tokens.long()] = 1.1
+                logits[:, q, :] /= penalty
 
         # Apply softmax for sampling if temp > 0. Else, do greedy sampling to avoid zero division error.
         if(ignore_tokens is not None and len(ignore_tokens) > 0):

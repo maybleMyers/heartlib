@@ -27,6 +27,7 @@ from scipy.io import wavfile
 import soundfile as sf
 from pydub import AudioSegment
 from mutagen.id3 import ID3, TXXX, ID3NoHeaderError
+from mutagen.flac import FLAC
 from omegaconf import OmegaConf
 
 # Add SongGeneration to path
@@ -34,8 +35,13 @@ SONGGEN_PATH = os.path.join(os.path.dirname(__file__), "SongGeneration")
 if SONGGEN_PATH not in sys.path:
     sys.path.insert(0, SONGGEN_PATH)
 
-# Defaults file path
+# Defaults file paths
 HEARTMULA_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "heartmula_defaults.json")
+SONGGEN_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "songgen_defaults.json")
+
+# Project root and output directory for Gradio allowed_paths
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 
 # Model layer counts for different versions
 MODEL_LAYER_COUNTS = {
@@ -48,6 +54,11 @@ SONGGEN_STYLE_TYPES = ['Pop', 'R&B', 'Dance', 'Jazz', 'Folk', 'Rock', 'Chinese S
 
 # SongGeneration model options
 SONGGEN_MODELS = ['songgeneration_large', 'songgeneration_base', 'songgeneration_base_new', 'songgeneration_base_full']
+
+# SongGeneration Description Builder options
+SONGGEN_GENDERS = ['None', 'Male', 'Female']
+SONGGEN_TIMBRES = ['None', 'Dark', 'Bright', 'Warm', 'Soft', 'Vocal', 'Varies']
+SONGGEN_EMOTIONS = ['None', 'Sad', 'Emotional', 'Angry', 'Happy', 'Uplifting', 'Intense', 'Romantic', 'Melancholic']
 
 # Global stop event for batch cancellation
 stop_event = threading.Event()
@@ -535,6 +546,12 @@ def generate_music_songgen(
     generate_type: str = "mixed",
     style_type: str = "Auto",
     ref_audio_path: str = None,
+    compile_model: bool = False,
+    top_p: float = 0.0,
+    gender: str = "None",
+    timbre: str = "None",
+    emotion: str = "None",
+    bpm: int = 0,
 ):
     """Generate music using SongGeneration (LeVo) backend.
 
@@ -558,6 +575,18 @@ def generate_music_songgen(
     def cleanup():
         """Clean up GPU memory."""
         os.chdir(original_cwd)
+
+        # Reset dynamo/CUDA graphs state
+        try:
+            torch._dynamo.reset()
+        except (AssertionError, RuntimeError):
+            pass
+        try:
+            from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+            reset_cudagraph_trees()
+        except (ImportError, AssertionError, RuntimeError):
+            pass
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -613,16 +642,29 @@ def generate_music_songgen(
         # Convert gpu_blocks to int
         gpu_blocks = int(gpu_blocks)
 
+        # Build preview of description for logging
+        log_desc_parts = []
+        if gender != "None":
+            log_desc_parts.append(gender.lower())
+        if timbre != "None":
+            log_desc_parts.append(timbre.lower())
+        if tags.strip():
+            log_desc_parts.append(tags.strip())
+        if emotion != "None":
+            log_desc_parts.append(emotion.lower())
+        if bpm > 0:
+            log_desc_parts.append(f"the bpm is {bpm}")
+        log_description = ", ".join(log_desc_parts) if log_desc_parts else "(none)"
+
         log("=" * 50)
         log(f"Starting SongGeneration batch ({batch_count} songs)...")
         log(f"Model: {songgen_model}")
         log(f"Style: {style_type}")
-        if tags.strip():
-            log(f"Description: {tags}")
+        log(f"Description: {log_description}")
         if ref_audio_path and os.path.isfile(ref_audio_path):
             log(f"Reference audio: {ref_audio_path}")
         log(f"Generate type: {generate_type}")
-        log(f"Temperature: {temperature}, Top-K: {topk}, CFG Scale: {cfg_scale}")
+        log(f"Temperature: {temperature}, Top-K: {topk}, Top-P: {top_p}, CFG Scale: {cfg_scale}")
 
         yield (*create_audio_outputs([]), "Loading SongGeneration model...")
 
@@ -663,11 +705,14 @@ def generate_music_songgen(
         cfg = OmegaConf.load(cfg_path)
         cfg.lm.use_flash_attn_2 = use_flash_attn
         cfg.mode = 'inference'
-        max_dur = cfg.max_dur
+        config_max_dur = cfg.max_dur
         sample_rate = cfg.sample_rate
 
+        # Use user's max_duration, capped at config maximum
+        max_dur = min(max_duration_seconds, config_max_dur)
+
         log(f"use_flash_attn: {use_flash_attn}")
-        log(f"Max duration from config: {max_dur}s, Sample rate: {sample_rate}")
+        log(f"Max duration: {max_dur}s (config max: {config_max_dur}s), Sample rate: {sample_rate}")
 
         # Check if we need separator for reference audio
         use_ref_audio = ref_audio_path is not None and os.path.isfile(ref_audio_path)
@@ -784,6 +829,26 @@ def generate_music_songgen(
         else:
             audiolm = audiolm.cuda().to(torch.float16)
 
+        # Optionally compile model for faster inference
+        if compile_model and not use_offload:
+            try:
+                log("Compiling SongGeneration model (first run will be slower)...")
+                # Use default mode - safest for autoregressive generation with
+                # changing sequence lengths. Avoids constant autotune overhead.
+                audiolm.transformer = torch.compile(
+                    audiolm.transformer,
+                    dynamic=True
+                )
+                audiolm.transformer2 = torch.compile(
+                    audiolm.transformer2,
+                    dynamic=True
+                )
+                log("Model compiled successfully")
+            except (AssertionError, RuntimeError) as e:
+                log(f"Warning: Compilation failed ({e}), running without compilation")
+        elif compile_model and use_offload:
+            log("Warning: torch.compile disabled - incompatible with layer offloading")
+
         # Create model wrapper (without decoder for now - will load later for decoding)
         model = CodecLM(
             name="tmp",
@@ -800,7 +865,7 @@ def generate_music_songgen(
             temperature=temperature,
             cfg_coef=cfg_scale,
             top_k=topk,
-            top_p=0.0,
+            top_p=top_p,
             record_tokens=True,
             record_window=50
         )
@@ -882,10 +947,24 @@ def generate_music_songgen(
                 bgm_wav_enc = prompt_token[:, [2], :]
                 melody_is_wav = False
 
+            # Build description from dropdowns + manual tags
+            description_parts = []
+            if gender != "None":
+                description_parts.append(gender.lower())
+            if timbre != "None":
+                description_parts.append(timbre.lower())
+            if tags.strip():
+                description_parts.append(tags.strip())
+            if emotion != "None":
+                description_parts.append(emotion.lower())
+            if bpm > 0:
+                description_parts.append(f"the bpm is {bpm}")
+            final_description = ", ".join(description_parts) if description_parts else None
+
             # Generate tokens with LM
             generate_inp = {
                 'lyrics': [lyrics.replace("  ", " ")],
-                'descriptions': [tags if tags.strip() else None],
+                'descriptions': [final_description],
                 'melody_wavs': pmt_wav,
                 'vocal_wavs': vocal_wav_enc,
                 'bgm_wavs': bgm_wav_enc,
@@ -896,9 +975,20 @@ def generate_music_songgen(
             if use_offload and offload_profiler is not None:
                 offload_profiler.reset_empty_cache_mem_line()
 
+            # Generate tokens with LM - model.generate() is now a generator
+            # that yields progress updates and final result
+            tokens = None
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 with torch.no_grad():
-                    tokens = model.generate(**generate_inp, return_tokens=True)
+                    for item in model.generate(**generate_inp, return_tokens=True):
+                        if item[0] == "progress":
+                            _, step, total = item
+                            progress_status = f"Generating {i+1}/{batch_count}: step {step}/{total}"
+                            yield (*create_audio_outputs(all_generated_music, labels), progress_status)
+                        else:
+                            # Final result
+                            tokens = item[1]
+                            break
 
             mid_time = time.perf_counter()
             log(f"LM generation took {mid_time - start_time:.1f}s")
@@ -926,6 +1016,34 @@ def generate_music_songgen(
 
             # Save output
             torchaudio.save(output_path, wav_out[0].cpu().float(), sample_rate)
+
+            # Build and write metadata
+            songgen_metadata = {
+                "lyrics": lyrics,
+                "tags": tags,
+                "description": final_description,
+                "gender": gender,
+                "timbre": timbre,
+                "emotion": emotion,
+                "bpm": bpm,
+                "max_duration": max_duration_seconds,
+                "temperature": temperature,
+                "topk": topk,
+                "top_p": top_p,
+                "cfg_scale": cfg_scale,
+                "seed": current_seed,
+                "songgen_model": songgen_model,
+                "songgen_ckpt_path": songgen_ckpt_path,
+                "style_type": style_type,
+                "generate_type": generate_type,
+                "use_flash_attn": use_flash_attn,
+                "gpu_blocks": gpu_blocks,
+                "compile_model": compile_model,
+                "ref_audio_path": ref_audio_path if use_ref_audio else None,
+                "generated_at": datetime.now().isoformat(),
+                "generation_time_seconds": end_time - start_time,
+            }
+            write_flac_metadata(output_path, songgen_metadata)
 
             elapsed = time.perf_counter() - start_time
             log(f"Song {i+1} complete! Total: {elapsed:.1f}s")
@@ -968,6 +1086,35 @@ def generate_music_songgen(
         yield (*create_audio_outputs(all_generated_music, labels), error_msg)
     finally:
         cleanup()
+
+
+def write_flac_metadata(flac_path, metadata):
+    """Write metadata to a FLAC file using Vorbis comments."""
+    try:
+        audio = FLAC(flac_path)
+        # Store metadata as JSON in a custom tag
+        audio["SONGGEN_METADATA"] = json.dumps(metadata)
+        # Also store some key fields as standard tags for easy viewing
+        if "lyrics" in metadata:
+            audio["LYRICS"] = metadata["lyrics"][:500] if len(metadata.get("lyrics", "")) > 500 else metadata.get("lyrics", "")
+        if "tags" in metadata:
+            audio["DESCRIPTION"] = metadata.get("tags", "")
+        if "seed" in metadata:
+            audio["COMMENT"] = f"Seed: {metadata['seed']}"
+        audio.save()
+    except Exception as e:
+        log(f"Warning: Could not write FLAC metadata: {e}")
+
+
+def read_flac_metadata(flac_path):
+    """Read SongGen metadata from a FLAC file."""
+    try:
+        audio = FLAC(flac_path)
+        if "SONGGEN_METADATA" in audio:
+            return json.loads(audio["SONGGEN_METADATA"][0])
+    except Exception as e:
+        log(f"Warning: Could not read FLAC metadata: {e}")
+    return None
 
 
 # Post-processing functions
@@ -1504,6 +1651,57 @@ with gr.Blocks(
                                 step=1,
                                 info="Layer offload depth: 0=all on GPU (~20GB), 4=recommended (~8GB), 6-8=aggressive (~5GB)"
                             )
+                        songgen_compile = gr.Checkbox(
+                            label="Compile Model (torch.compile)",
+                            value=False,
+                            info="Faster inference after first run. May not work with layer offloading."
+                        )
+
+                        with gr.Accordion("Description Builder", open=True):
+                            gr.Markdown("*Build style description from presets (combines with manual tags)*")
+                            with gr.Row():
+                                songgen_gender = gr.Dropdown(
+                                    label="Gender",
+                                    choices=SONGGEN_GENDERS,
+                                    value="None",
+                                    scale=1
+                                )
+                                songgen_timbre = gr.Dropdown(
+                                    label="Timbre",
+                                    choices=SONGGEN_TIMBRES,
+                                    value="None",
+                                    scale=1
+                                )
+                                songgen_emotion = gr.Dropdown(
+                                    label="Emotion",
+                                    choices=SONGGEN_EMOTIONS,
+                                    value="None",
+                                    scale=1
+                                )
+                            songgen_bpm = gr.Number(
+                                label="BPM (0 = auto)",
+                                value=0,
+                                minimum=0,
+                                maximum=200,
+                                step=1,
+                                info="Target beats per minute (leave 0 for automatic)"
+                            )
+
+                        with gr.Accordion("Lyric Structure Tags", open=False):
+                            gr.Markdown("""
+**Vocal sections (require lyrics):**
+- `[verse]` - Lyrical verse
+- `[chorus]` - Lyrical chorus
+- `[bridge]` - Lyrical bridge
+
+**Instrumental sections (no lyrics):**
+- `[intro-short/medium/long]` - Intros
+- `[inst-short/medium/long]` - Instrumental breaks
+- `[outro-short/medium/long]` - Outros
+- `[silence]` - Silence
+
+**Format:** Sections separated by ` ; ` and sentences by `.`
+                            """)
 
                     # Common settings
                     with gr.Accordion("Output Settings", open=True):
@@ -1517,35 +1715,47 @@ with gr.Blocks(
                         max_duration = gr.Slider(
                             label="Max Duration (seconds)",
                             minimum=10,
-                            maximum=240,
+                            maximum=270,
                             value=120,
-                            step=10
+                            step=10,
+                            info="Max varies by model: base=150s, large/full=270s"
                         )
                         with gr.Row():
                             temperature = gr.Slider(
                                 label="Temperature",
                                 minimum=0.1,
                                 maximum=2.0,
-                                value=1.0,
+                                value=0.9,
                                 step=0.1,
                                 scale=1
                             )
                             topk = gr.Slider(
                                 label="Top-K",
                                 minimum=1,
-                                maximum=200,
+                                maximum=100,
                                 value=50,
                                 step=1,
                                 scale=1
                             )
-                        cfg_scale = gr.Slider(
-                            label="CFG Scale (Guidance)",
-                            minimum=1.0,
-                            maximum=12.0,
-                            value=1.5,
-                            step=0.1,
-                            info="Higher = stronger adherence to tags/lyrics"
-                        )
+                        with gr.Row():
+                            cfg_scale = gr.Slider(
+                                label="CFG Scale (Guidance)",
+                                minimum=0.1,
+                                maximum=5.0,
+                                value=1.5,
+                                step=0.1,
+                                info="Higher = stronger adherence to tags/lyrics",
+                                scale=1
+                            )
+                            songgen_top_p = gr.Slider(
+                                label="Top-P (Nucleus)",
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.0,
+                                step=0.05,
+                                info="0.0 = use Top-K only",
+                                scale=1
+                            )
 
                 # Right column - Output
                 with gr.Column():
@@ -1773,7 +1983,8 @@ with gr.Blocks(
         num_steps_val, ref_audio_sec_val,
         # SongGeneration params
         songgen_ckpt_path_val, songgen_model_val, songgen_style_val, songgen_generate_type_val,
-        songgen_flash_attn_val, songgen_gpu_blocks_val,
+        songgen_flash_attn_val, songgen_gpu_blocks_val, songgen_compile_val,
+        songgen_top_p_val, songgen_gender_val, songgen_timbre_val, songgen_emotion_val, songgen_bpm_val,
     ):
         """Wrapper to call the appropriate generation function based on backend."""
         if backend == "HeartMuLa":
@@ -1791,7 +2002,8 @@ with gr.Blocks(
                 songgen_model_val, songgen_ckpt_path_val,
                 batch_count_val, seed_val, output_folder_val,
                 songgen_flash_attn_val, songgen_gpu_blocks_val, songgen_generate_type_val,
-                songgen_style_val, ref_audio_semantic_val,
+                songgen_style_val, ref_audio_semantic_val, songgen_compile_val,
+                songgen_top_p_val, songgen_gender_val, songgen_timbre_val, songgen_emotion_val, int(songgen_bpm_val),
             )
 
     generate_event = generate_btn.click(
@@ -1808,7 +2020,8 @@ with gr.Blocks(
             num_steps_slider, ref_audio_sec_slider,
             # SongGeneration params
             songgen_ckpt_path, songgen_model, songgen_style, songgen_generate_type,
-            songgen_flash_attn, songgen_gpu_blocks,
+            songgen_flash_attn, songgen_gpu_blocks, songgen_compile,
+            songgen_top_p, songgen_gender, songgen_timbre, songgen_emotion, songgen_bpm,
         ],
         outputs=audio_outputs + [status_text]
     )
@@ -1820,67 +2033,134 @@ with gr.Blocks(
     )
 
     # Save/Load Defaults
-    # Components to save (in order)
-    defaults_components = [
+    # HeartMuLa-specific components (unique to HeartMuLa)
+    heartmula_components = [
         lyrics_input, tags_input, negative_prompt_input, batch_count, seed,
         model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
         max_duration, temperature, topk, cfg_scale, compile_checkbox, use_rl_models_checkbox,
         num_steps_slider, ref_strength_slider, normalize_loudness_checkbox, loudness_boost_slider, ref_audio_sec_slider
     ]
 
-    # Keys for the defaults file (must match order of components)
-    defaults_keys = [
+    # Keys for the HeartMuLa defaults file
+    heartmula_keys = [
         "lyrics", "tags", "negative_prompt", "batch_count", "seed",
         "model_path", "model_version", "model_dtype", "num_gpu_blocks", "output_folder",
         "max_duration", "temperature", "topk", "cfg_scale", "compile_model", "use_rl_models",
         "num_steps", "ref_strength", "normalize_loudness", "loudness_boost", "ref_audio_sec"
     ]
 
-    def save_defaults(*values):
-        """Save current settings to defaults file."""
-        settings = {}
-        for i, key in enumerate(defaults_keys):
-            settings[key] = values[i]
-        try:
-            with open(HEARTMULA_DEFAULTS_FILE, 'w') as f:
-                json.dump(settings, f, indent=2)
-            return "Defaults saved successfully."
-        except Exception as e:
-            return f"Error saving defaults: {e}"
+    # SongGen-specific components (unique to SongGen - no overlap with heartmula_components)
+    songgen_only_components = [
+        songgen_ckpt_path, songgen_model, songgen_style, songgen_generate_type,
+        songgen_flash_attn, songgen_gpu_blocks, songgen_compile,
+        songgen_top_p, songgen_gender, songgen_timbre, songgen_emotion, songgen_bpm,
+    ]
 
-    def load_defaults(request: gr.Request = None):
-        """Load settings from defaults file."""
-        if not os.path.exists(HEARTMULA_DEFAULTS_FILE):
+    # Keys for the SongGen-only components
+    songgen_only_keys = [
+        "songgen_ckpt_path", "songgen_model", "songgen_style", "songgen_generate_type",
+        "songgen_flash_attn", "songgen_gpu_blocks", "songgen_compile",
+        "songgen_top_p", "songgen_gender", "songgen_timbre", "songgen_emotion", "songgen_bpm",
+    ]
+
+    # Shared component indices in heartmula_components that SongGen also uses
+    # These are: lyrics(0), tags(1), batch_count(3), seed(4), output_folder(9),
+    #            max_duration(10), temperature(11), topk(12), cfg_scale(13)
+    shared_indices = [0, 1, 3, 4, 9, 10, 11, 12, 13]
+    shared_keys = ["lyrics", "tags", "batch_count", "seed", "output_folder",
+                   "max_duration", "temperature", "topk", "cfg_scale"]
+
+    # All unique components for UI updates (HeartMuLa + SongGen-only)
+    all_defaults_components = heartmula_components + songgen_only_components
+
+    # For backward compatibility
+    defaults_components = heartmula_components
+    defaults_keys = heartmula_keys
+
+    def save_defaults(backend, *values):
+        """Save current settings to defaults file based on backend."""
+        heartmula_values = values[:len(heartmula_keys)]
+        songgen_only_values = values[len(heartmula_keys):]
+
+        if backend == "SongGeneration (LeVo)":
+            # Save SongGen defaults - shared fields from heartmula + songgen-only
+            settings = {}
+            # Add shared fields from heartmula_values
+            for idx, key in zip(shared_indices, shared_keys):
+                settings[key] = heartmula_values[idx]
+            # Add songgen-only fields
+            for i, key in enumerate(songgen_only_keys):
+                settings[key] = songgen_only_values[i]
+            try:
+                with open(SONGGEN_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings, f, indent=2)
+                return "SongGen defaults saved successfully."
+            except Exception as e:
+                return f"Error saving SongGen defaults: {e}"
+        else:
+            # Save HeartMuLa defaults
+            settings = {}
+            for i, key in enumerate(heartmula_keys):
+                settings[key] = heartmula_values[i]
+            try:
+                with open(HEARTMULA_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings, f, indent=2)
+                return "HeartMuLa defaults saved successfully."
+            except Exception as e:
+                return f"Error saving HeartMuLa defaults: {e}"
+
+    def load_defaults(backend, request: gr.Request = None):
+        """Load settings from defaults file based on backend."""
+        total_components = len(heartmula_keys) + len(songgen_only_keys)
+
+        if backend == "SongGeneration (LeVo)":
+            defaults_file = SONGGEN_DEFAULTS_FILE
+        else:
+            defaults_file = HEARTMULA_DEFAULTS_FILE
+
+        if not os.path.exists(defaults_file):
             if request:
-                return [gr.update()] * len(defaults_keys) + ["No defaults file found."]
+                return [gr.update()] * total_components + [f"No {backend} defaults file found."]
             else:
-                return [gr.update()] * len(defaults_keys) + [""]
+                return [gr.update()] * total_components + [""]
 
         try:
-            with open(HEARTMULA_DEFAULTS_FILE, 'r') as f:
+            with open(defaults_file, 'r') as f:
                 loaded = json.load(f)
         except Exception as e:
-            return [gr.update()] * len(defaults_keys) + [f"Error loading defaults: {e}"]
+            return [gr.update()] * total_components + [f"Error loading defaults: {e}"]
 
-        updates = []
-        for key in defaults_keys:
-            if key in loaded:
-                updates.append(gr.update(value=loaded[key]))
-            else:
-                updates.append(gr.update())
+        # Build updates list
+        updates = [gr.update()] * total_components
 
-        return updates + ["Defaults loaded successfully."]
+        if backend == "SongGeneration (LeVo)":
+            # Load shared fields into heartmula component positions
+            for idx, key in zip(shared_indices, shared_keys):
+                if key in loaded:
+                    updates[idx] = gr.update(value=loaded[key])
+            # Load songgen-only fields
+            offset = len(heartmula_keys)
+            for i, key in enumerate(songgen_only_keys):
+                if key in loaded:
+                    updates[offset + i] = gr.update(value=loaded[key])
+        else:
+            # Load HeartMuLa fields
+            for i, key in enumerate(heartmula_keys):
+                if key in loaded:
+                    updates[i] = gr.update(value=loaded[key])
+
+        return updates + [f"{backend} defaults loaded successfully."]
 
     save_defaults_btn.click(
         fn=save_defaults,
-        inputs=defaults_components,
+        inputs=[backend_selector] + all_defaults_components,
         outputs=[status_text]
     )
 
     load_defaults_btn.click(
         fn=load_defaults,
-        inputs=None,
-        outputs=defaults_components + [status_text]
+        inputs=[backend_selector],
+        outputs=all_defaults_components + [status_text]
     )
 
     # Audio Info Tab event handlers
@@ -1941,14 +2221,13 @@ with gr.Blocks(
 
     def send_settings_to_generation(metadata):
         """Send loaded metadata settings to the generation tab."""
+        total_components = len(heartmula_keys) + len(songgen_only_keys)
         if metadata is None:
-            return [gr.update()] * 21 + ["No metadata loaded. Please upload an MP3 first."]
+            return [gr.update()] * total_components + ["No metadata loaded. Please upload an MP3 first."]
 
         # Map metadata to generation tab components
-        # Order matches defaults_components: lyrics, tags, negative_prompt, batch_count, seed,
-        # model_path, model_version, model_dtype, num_gpu_blocks, output_folder,
-        # max_duration, temperature, topk, cfg_scale, compile_model, use_rl_models, num_steps, ref_strength, normalize_loudness, loudness_boost, ref_audio_sec
-        updates = [
+        # HeartMuLa components (21)
+        heartmula_updates = [
             gr.update(value=metadata.get("lyrics", "")),
             gr.update(value=metadata.get("tags", "")),
             gr.update(value=metadata.get("negative_prompt", "")),
@@ -1972,7 +2251,10 @@ with gr.Blocks(
             gr.update(value=metadata.get("ref_audio_sec", 30)),
         ]
 
-        return updates + ["Settings loaded to Generation tab!"]
+        # SongGen-only components - no update (keep current values)
+        songgen_updates = [gr.update()] * len(songgen_only_keys)
+
+        return heartmula_updates + songgen_updates + ["Settings loaded to Generation tab!"]
 
     # Info display components for Audio Info tab
     # Order must match load_mp3_metadata return values
@@ -1999,7 +2281,7 @@ with gr.Blocks(
     load_settings_btn.click(
         fn=send_settings_to_generation,
         inputs=[loaded_metadata_state],
-        outputs=defaults_components + [audio_info_status]
+        outputs=all_defaults_components + [audio_info_status]
     )
 
     # Post-Processing Tab event handlers
@@ -2059,13 +2341,39 @@ with gr.Blocks(
 
     # Auto-load defaults on startup
     def initial_load_defaults():
-        results = load_defaults(None)
-        return results[:-1]  # Exclude status message
+        """Load both HeartMuLa and SongGen defaults on startup."""
+        total_components = len(heartmula_keys) + len(songgen_only_keys)
+        updates = [gr.update()] * total_components
+
+        # Load HeartMuLa defaults
+        if os.path.exists(HEARTMULA_DEFAULTS_FILE):
+            try:
+                with open(HEARTMULA_DEFAULTS_FILE, 'r') as f:
+                    heartmula_loaded = json.load(f)
+                for i, key in enumerate(heartmula_keys):
+                    if key in heartmula_loaded:
+                        updates[i] = gr.update(value=heartmula_loaded[key])
+            except Exception:
+                pass
+
+        # Load SongGen-only defaults
+        if os.path.exists(SONGGEN_DEFAULTS_FILE):
+            try:
+                with open(SONGGEN_DEFAULTS_FILE, 'r') as f:
+                    songgen_loaded = json.load(f)
+                offset = len(heartmula_keys)
+                for i, key in enumerate(songgen_only_keys):
+                    if key in songgen_loaded:
+                        updates[offset + i] = gr.update(value=songgen_loaded[key])
+            except Exception:
+                pass
+
+        return updates
 
     demo.load(
         fn=initial_load_defaults,
         inputs=None,
-        outputs=defaults_components
+        outputs=all_defaults_components
     )
 
 
@@ -2108,5 +2416,6 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=port,
         share=args.share,
-        show_error=True
+        show_error=True,
+        allowed_paths=[DEFAULT_OUTPUT_DIR]
     )

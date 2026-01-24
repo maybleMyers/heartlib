@@ -139,17 +139,27 @@ class CodecLM:
             bgm_wavs = list(bgm_wavs)
         
         texts, audio_qt_embs = self._prepare_tokens_and_attributes(lyrics=lyrics, melody_wavs=melody_wavs, vocal_wavs=vocal_wavs, bgm_wavs=bgm_wavs, melody_is_wav=melody_is_wav)
-        tokens = self._generate_tokens(texts, descriptions, audio_qt_embs)
+
+        # _generate_tokens is now a generator that yields progress and final result
+        tokens = None
+        for item in self._generate_tokens(texts, descriptions, audio_qt_embs):
+            if item[0] == "progress":
+                # Yield progress through to caller
+                yield item
+            else:
+                # Final result
+                tokens = item[1]
+                break
 
         if (tokens == self.lm.eos_token_id).any():
             length = torch.nonzero(torch.eq(tokens, self.lm.eos_token_id))[:,-1].min()
-            tokens = tokens[...,:length] 
+            tokens = tokens[...,:length]
 
         if return_tokens:
-            return tokens
+            yield ("result", tokens)
         else:
             out = self.generate_audio(tokens)
-            return out
+            yield ("result", out)
 
 
     @torch.no_grad()
@@ -260,15 +270,25 @@ class CodecLM:
 
         if self.duration <= self.max_duration:
             # generate by sampling from LM, simple case.
+            # lm.generate() is now a generator that yields progress and final result
             with self.autocast:
-                gen_tokens = self.lm.generate(texts=texts, 
-                                              descriptions=descriptions, 
-                                              audio_qt_embs=audio_qt_embs, 
-                                              max_gen_len=total_gen_len, 
-                                              **self.generation_params)
+                gen = self.lm.generate(texts=texts,
+                                       descriptions=descriptions,
+                                       audio_qt_embs=audio_qt_embs,
+                                       max_gen_len=total_gen_len,
+                                       **self.generation_params)
+                gen_tokens = None
+                for item in gen:
+                    if item[0] == "progress":
+                        # Yield progress through to caller
+                        yield item
+                    else:
+                        # Final result
+                        gen_tokens = item[1]
+                        break
         else:
             raise NotImplementedError(f"duration {self.duration} < max duration {self.max_duration}")
-        return gen_tokens
+        yield ("result", gen_tokens)
 
     @torch.no_grad()
     def generate_audio(self, gen_tokens: torch.Tensor, prompt=None, vocal_prompt=None, bgm_prompt=None, chunked=False, chunk_size=128, gen_type='mixed'):

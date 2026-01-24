@@ -33,6 +33,7 @@ mutagen>=1.47.0
 # SongGeneration dependencies
 flashy>=0.0.2
 diffusers>=0.27.0
+k-diffusion>=0.1.1
 alias-free-torch>=0.0.6
 descript-audio-codec>=1.0.0
 einops-exts>=0.0.4
@@ -64,3 +65,4 @@ gradio>=5.23.1
 # MuQ-MuLan support
 muq
 scipy
+scikit-image

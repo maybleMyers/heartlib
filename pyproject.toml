@@ -36,6 +36,7 @@ dependencies = [
     # SongGeneration dependencies
     "flashy>=0.0.2",
     "diffusers>=0.27.0",
+    "k-diffusion>=0.1.1",
     "alias-free-torch>=0.0.6",
     "descript-audio-codec>=1.0.0",
     "einops-exts>=0.0.4",
@@ -64,6 +65,7 @@ dependencies = [
     # MuQ-MuLan support
     "muq",
     "scipy",
+    "scikit-image",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -102,4 +104,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
+
+# Override k-diffusion's outdated dependency constraints (requires numpy<2, torch<2)
+[tool.uv]
+override-dependencies = [
+    "numpy>=2.0.2",
+    "torch>=2.4.1",
+]
 
