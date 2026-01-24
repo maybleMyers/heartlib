@@ -24,6 +24,7 @@ from scipy import signal
 from scipy.io import wavfile
 import soundfile as sf
 from pydub import AudioSegment
+from mutagen.id3 import ID3, TXXX, ID3NoHeaderError
 
 # Defaults file path
 HEARTMULA_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "heartmula_defaults.json")
@@ -504,8 +505,8 @@ def generate_music(
 
 
 # Post-processing functions
-def save_audio_as_mp3(data, sr, is_stereo):
-    """Save audio data as MP3 file and return the path."""
+def save_audio_as_mp3(data, sr, is_stereo, metadata=None):
+    """Save audio data as MP3 file with metadata and return the path."""
     # Save as temporary WAV first
     temp_wav = tempfile.mktemp(suffix=".wav")
     if not is_stereo:
@@ -520,11 +521,45 @@ def save_audio_as_mp3(data, sr, is_stereo):
     # Clean up temp WAV
     os.remove(temp_wav)
 
+    # Write metadata if provided
+    if metadata:
+        try:
+            try:
+                tags = ID3(output_path)
+            except ID3NoHeaderError:
+                tags = ID3()
+
+            # Store HeartMuLa metadata as JSON in TXXX frame
+            tags.add(TXXX(encoding=3, desc="HEARTMULA_METADATA", text=json.dumps(metadata)))
+            tags.save(output_path)
+        except Exception as e:
+            log(f"Warning: Could not write metadata: {e}")
+
     return output_path
 
 
+def read_audio_metadata(audio_path):
+    """Read HeartMuLa metadata from an audio file."""
+    if not audio_path or not os.path.exists(audio_path):
+        return None
+
+    # Try reading from MP3 ID3 tags (no network required)
+    if audio_path.lower().endswith('.mp3'):
+        try:
+            tags = ID3(audio_path)
+            for frame in tags.values():
+                if isinstance(frame, TXXX) and frame.desc == "HEARTMULA_METADATA":
+                    return json.loads(frame.text[0])
+        except ID3NoHeaderError:
+            pass
+        except Exception:
+            pass
+
+    return None
+
+
 def load_audio_for_processing(audio_path):
-    """Load audio file and return sample rate and data."""
+    """Load audio file and return sample rate, data, and metadata."""
     if audio_path is None:
         return None, None, "No audio file provided."
 
@@ -537,8 +572,12 @@ def load_audio_for_processing(audio_path):
             is_stereo = False
             data = data.reshape(-1, 1)
 
+        # Extract metadata
+        metadata = read_audio_metadata(audio_path)
+
         duration = len(data) / sr
-        return (sr, data, is_stereo), None, f"Loaded: {os.path.basename(audio_path)} ({duration:.2f}s, {sr}Hz)"
+        metadata_status = " (with metadata)" if metadata else ""
+        return (sr, data, is_stereo, metadata), None, f"Loaded: {os.path.basename(audio_path)} ({duration:.2f}s, {sr}Hz){metadata_status}"
     except Exception as e:
         return None, None, f"Error loading audio: {e}"
 
@@ -548,7 +587,7 @@ def trim_audio(audio_state, start_time, end_time):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
     duration = len(data) / sr
 
     # Validate times
@@ -566,8 +605,8 @@ def trim_audio(audio_state, start_time, end_time):
     # Trim
     trimmed_data = data[start_sample:end_sample]
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(trimmed_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(trimmed_data, sr, is_stereo, metadata)
 
     new_duration = len(trimmed_data) / sr
     return output_path, f"Trimmed: {start_time:.2f}s to {end_time:.2f}s (new duration: {new_duration:.2f}s)"
@@ -578,7 +617,7 @@ def adjust_loudness(audio_state, gain_db):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     # Convert dB to linear gain
     linear_gain = 10 ** (gain_db / 20)
@@ -589,8 +628,8 @@ def adjust_loudness(audio_state, gain_db):
     # Clip to prevent distortion
     adjusted_data = np.clip(adjusted_data, -1.0, 1.0)
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(adjusted_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(adjusted_data, sr, is_stereo, metadata)
 
     return output_path, f"Loudness adjusted by {gain_db:+.1f} dB"
 
@@ -600,7 +639,7 @@ def apply_bass_boost(audio_state, boost_db, cutoff_freq):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     # Measure original RMS loudness
     original_rms = np.sqrt(np.mean(data ** 2))
@@ -636,8 +675,8 @@ def apply_bass_boost(audio_state, boost_db, cutoff_freq):
     # Soft clip to prevent harsh distortion while preserving loudness
     result_data = np.tanh(result_data)
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo, metadata)
 
     return output_path, f"Bass boost: {boost_db:+.1f} dB below {cutoff_freq} Hz"
 
@@ -647,7 +686,7 @@ def apply_treble_boost(audio_state, boost_db, cutoff_freq):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     # Measure original RMS loudness
     original_rms = np.sqrt(np.mean(data ** 2))
@@ -681,8 +720,8 @@ def apply_treble_boost(audio_state, boost_db, cutoff_freq):
     # Soft clip to prevent harsh distortion
     result_data = np.tanh(result_data)
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo, metadata)
 
     return output_path, f"Treble boost: {boost_db:+.1f} dB above {cutoff_freq} Hz"
 
@@ -692,7 +731,7 @@ def normalize_audio(audio_state, target_db):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     # Find current peak
     current_peak = np.max(np.abs(data))
@@ -708,8 +747,8 @@ def normalize_audio(audio_state, target_db):
     # Apply gain
     normalized_data = data * linear_gain
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(normalized_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(normalized_data, sr, is_stereo, metadata)
 
     return output_path, f"Normalized to {target_db:.1f} dB (gain: {gain_db:+.1f} dB)"
 
@@ -719,7 +758,7 @@ def apply_fade_in(audio_state, fade_duration):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     fade_samples = int(fade_duration * sr)
     if fade_samples > len(data):
@@ -733,8 +772,8 @@ def apply_fade_in(audio_state, fade_duration):
     for ch in range(data.shape[1]):
         result_data[:fade_samples, ch] = data[:fade_samples, ch] * fade_curve
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo, metadata)
 
     return output_path, f"Fade-in applied: {fade_duration:.2f}s"
 
@@ -744,7 +783,7 @@ def apply_fade_out(audio_state, fade_duration):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     fade_samples = int(fade_duration * sr)
     if fade_samples > len(data):
@@ -758,8 +797,8 @@ def apply_fade_out(audio_state, fade_duration):
     for ch in range(data.shape[1]):
         result_data[-fade_samples:, ch] = data[-fade_samples:, ch] * fade_curve
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo, metadata)
 
     return output_path, f"Fade-out applied: {fade_duration:.2f}s"
 
@@ -769,7 +808,7 @@ def change_speed(audio_state, speed_factor):
     if audio_state is None:
         return None, "No audio loaded. Please load an audio file first."
 
-    sr, data, is_stereo = audio_state
+    sr, data, is_stereo, metadata = audio_state
 
     if speed_factor <= 0:
         return None, "Speed factor must be positive."
@@ -781,8 +820,8 @@ def change_speed(audio_state, speed_factor):
     for ch in range(data.shape[1]):
         result_data[:, ch] = signal.resample(data[:, ch], new_length)
 
-    # Save as MP3
-    output_path = save_audio_as_mp3(result_data, sr, is_stereo)
+    # Save as MP3 with metadata
+    output_path = save_audio_as_mp3(result_data, sr, is_stereo, metadata)
 
     new_duration = new_length / sr
     return output_path, f"Speed changed to {speed_factor:.2f}x (new duration: {new_duration:.2f}s)"
