@@ -27,6 +27,7 @@ from scipy.io import wavfile
 import soundfile as sf
 from pydub import AudioSegment
 from mutagen.id3 import ID3, TXXX, ID3NoHeaderError
+from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
 from omegaconf import OmegaConf
 
@@ -552,6 +553,8 @@ def generate_music_songgen(
     timbre: str = "None",
     emotion: str = "None",
     bpm: int = 0,
+    img2img_audio_path: str = None,
+    img2img_strength: float = 1.0,
 ):
     """Generate music using SongGeneration (LeVo) backend.
 
@@ -601,6 +604,8 @@ def generate_music_songgen(
         output_folder = os.path.abspath(output_folder)
         if ref_audio_path:
             ref_audio_path = os.path.abspath(ref_audio_path)
+        if img2img_audio_path:
+            img2img_audio_path = os.path.abspath(img2img_audio_path)
 
         # Validate inputs
         if not os.path.exists(ckpt_path):
@@ -663,6 +668,8 @@ def generate_music_songgen(
         log(f"Description: {log_description}")
         if ref_audio_path and os.path.isfile(ref_audio_path):
             log(f"Reference audio: {ref_audio_path}")
+        if img2img_audio_path and os.path.isfile(img2img_audio_path):
+            log(f"img2img audio: {img2img_audio_path} (strength={img2img_strength})")
         log(f"Generate type: {generate_type}")
         log(f"Temperature: {temperature}, Top-K: {topk}, Top-P: {top_p}, CFG Scale: {cfg_scale}")
 
@@ -833,8 +840,10 @@ def generate_music_songgen(
         if compile_model and not use_offload:
             try:
                 log("Compiling SongGeneration model (first run will be slower)...")
-                # Use default mode - safest for autoregressive generation with
-                # changing sequence lengths. Avoids constant autotune overhead.
+                # Increase cache limit to avoid recompile warnings during batch generation
+                # Default is 8, we need ~2 per song (None→tuple transition for KV cache)
+                torch._dynamo.config.cache_size_limit = 128
+
                 audiolm.transformer = torch.compile(
                     audiolm.transformer,
                     dynamic=True
@@ -856,6 +865,8 @@ def generate_music_songgen(
             audiotokenizer=None,
             max_duration=max_dur,
             seperate_tokenizer=None,  # Will load later for decoding
+            demucs_model_path=os.path.join(SONGGEN_PATH, 'third_party/demucs/ckpt/htdemucs.pth'),
+            demucs_config_path=os.path.join(SONGGEN_PATH, 'third_party/demucs/ckpt/htdemucs.yaml'),
         )
 
         # Set generation parameters
@@ -904,7 +915,7 @@ def generate_music_songgen(
 
             # Create output path
             timestamp = int(time.time())
-            output_filename = f"songgen_{timestamp}_{current_seed}.flac"
+            output_filename = f"songgen_{timestamp}_{current_seed}.mp3"
             output_path = os.path.join(output_folder, output_filename)
 
             log(f"Output path: {output_path}")
@@ -971,6 +982,27 @@ def generate_music_songgen(
                 'melody_is_wav': melody_is_wav,
             }
 
+            # Add img2img audio if provided
+            if img2img_audio_path and os.path.isfile(img2img_audio_path):
+                # Load tokenizers for img2img encoding if not already loaded
+                if model.audiotokenizer is None:
+                    yield (*create_audio_outputs(all_generated_music, labels), "Loading tokenizers for img2img...")
+                    audio_tokenizer = builders.get_audio_tokenizer_model(cfg.audio_tokenizer_checkpoint, cfg)
+                    audio_tokenizer = audio_tokenizer.eval().cuda()
+                    model.audiotokenizer = audio_tokenizer
+
+                if model.seperate_tokenizer is None:
+                    seperate_tokenizer = builders.get_audio_tokenizer_model(cfg.audio_tokenizer_checkpoint_sep, cfg)
+                    seperate_tokenizer = seperate_tokenizer.eval().cuda()
+                    model.seperate_tokenizer = seperate_tokenizer
+
+                img2img_wav, img2img_sr = torchaudio.load(img2img_audio_path)
+                # Resample to 48kHz if needed (SongGeneration sample rate)
+                if img2img_sr != 48000:
+                    img2img_wav = torchaudio.functional.resample(img2img_wav, img2img_sr, 48000)
+                generate_inp['img2img_audio'] = img2img_wav.cuda()
+                generate_inp['img2img_strength'] = img2img_strength
+
             # Reset offload profiler cache before generation if using offloading
             if use_offload and offload_profiler is not None:
                 offload_profiler.reset_empty_cache_mem_line()
@@ -1014,10 +1046,7 @@ def generate_music_songgen(
             end_time = time.perf_counter()
             log(f"Diffusion/decoding took {end_time - mid_time:.1f}s")
 
-            # Save output
-            torchaudio.save(output_path, wav_out[0].cpu().float(), sample_rate)
-
-            # Build and write metadata
+            # Build metadata
             songgen_metadata = {
                 "lyrics": lyrics,
                 "tags": tags,
@@ -1040,10 +1069,14 @@ def generate_music_songgen(
                 "gpu_blocks": gpu_blocks,
                 "compile_model": compile_model,
                 "ref_audio_path": ref_audio_path if use_ref_audio else None,
+                "img2img_audio_path": img2img_audio_path if img2img_audio_path and os.path.isfile(img2img_audio_path) else None,
+                "img2img_strength": img2img_strength if img2img_audio_path and os.path.isfile(img2img_audio_path) else None,
                 "generated_at": datetime.now().isoformat(),
                 "generation_time_seconds": end_time - start_time,
             }
-            write_flac_metadata(output_path, songgen_metadata)
+
+            # Save output as MP3 with metadata
+            save_songgen_mp3(wav_out[0].cpu(), sample_rate, output_path, songgen_metadata)
 
             elapsed = time.perf_counter() - start_time
             log(f"Song {i+1} complete! Total: {elapsed:.1f}s")
@@ -1086,6 +1119,54 @@ def generate_music_songgen(
         yield (*create_audio_outputs(all_generated_music, labels), error_msg)
     finally:
         cleanup()
+
+
+def save_songgen_mp3(audio_tensor, sample_rate, output_path, metadata=None):
+    """Save SongGeneration audio tensor as MP3 with embedded metadata.
+
+    Args:
+        audio_tensor: Audio tensor from SongGeneration (channels x samples)
+        sample_rate: Sample rate of the audio
+        output_path: Path to save the MP3 file
+        metadata: Optional dict of metadata to embed
+    """
+    # Convert tensor to numpy array
+    audio_data = audio_tensor.float().numpy()
+
+    # Transpose if needed (torchaudio uses channels x samples, soundfile uses samples x channels)
+    if audio_data.ndim == 2 and audio_data.shape[0] <= 2:
+        audio_data = audio_data.T
+
+    # Save as temporary WAV
+    temp_wav = tempfile.mktemp(suffix=".wav")
+    sf.write(temp_wav, audio_data, sample_rate)
+
+    # Convert to MP3
+    audio_segment = AudioSegment.from_wav(temp_wav)
+    audio_segment.export(output_path, format="mp3", bitrate="192k")
+
+    # Clean up temp WAV
+    os.remove(temp_wav)
+
+    # Write metadata if provided
+    if metadata:
+        try:
+            # Load the MP3 file
+            audio = MP3(output_path)
+
+            # Add ID3 tags if they don't exist
+            if audio.tags is None:
+                audio.add_tags()
+
+            # Store metadata as JSON in TXXX frame (same format as HeartMuLa)
+            metadata_json = json.dumps(metadata)
+            audio.tags.add(TXXX(encoding=3, desc="HEARTMULA_METADATA", text=metadata_json))
+            audio.save()
+            log(f"Saved metadata to {output_path} ({len(metadata_json)} bytes)")
+        except Exception as e:
+            import traceback
+            log(f"Warning: Could not write MP3 metadata: {e}")
+            log(f"Traceback: {traceback.format_exc()}")
 
 
 def write_flac_metadata(flac_path, metadata):
@@ -1947,19 +2028,6 @@ with gr.Blocks(
     def randomize_seed():
         return -1
 
-    def switch_backend(backend):
-        """Switch visibility between HeartMuLa and SongGeneration settings."""
-        if backend == "HeartMuLa":
-            return gr.update(visible=True), gr.update(visible=False)
-        else:
-            return gr.update(visible=False), gr.update(visible=True)
-
-    backend_selector.change(
-        fn=switch_backend,
-        inputs=[backend_selector],
-        outputs=[heartmula_settings, songgen_settings]
-    )
-
     model_version.change(
         fn=update_blocks_slider,
         inputs=[model_version],
@@ -1997,6 +2065,7 @@ with gr.Blocks(
             )
         else:
             # Use ref_audio_semantic as the reference audio for SongGeneration
+            # ref_audio_img2img and ref_strength are used for img2img generation
             yield from generate_music_songgen(
                 lyrics, tags, max_duration_val, temperature_val, topk_val, cfg_scale_val,
                 songgen_model_val, songgen_ckpt_path_val,
@@ -2004,6 +2073,7 @@ with gr.Blocks(
                 songgen_flash_attn_val, songgen_gpu_blocks_val, songgen_generate_type_val,
                 songgen_style_val, ref_audio_semantic_val, songgen_compile_val,
                 songgen_top_p_val, songgen_gender_val, songgen_timbre_val, songgen_emotion_val, int(songgen_bpm_val),
+                img2img_audio_path=ref_audio_img2img_val, img2img_strength=ref_strength_val,
             )
 
     generate_event = generate_btn.click(
@@ -2076,6 +2146,57 @@ with gr.Blocks(
     # For backward compatibility
     defaults_components = heartmula_components
     defaults_keys = heartmula_keys
+
+    # Backend switching with automatic defaults loading
+    def switch_backend_and_load_defaults(backend):
+        """Switch visibility between HeartMuLa and SongGeneration settings and load corresponding defaults."""
+        total_components = len(heartmula_keys) + len(songgen_only_keys)
+
+        # Determine visibility
+        if backend == "HeartMuLa":
+            visibility_updates = [gr.update(visible=True), gr.update(visible=False)]
+            defaults_file = HEARTMULA_DEFAULTS_FILE
+        else:
+            visibility_updates = [gr.update(visible=False), gr.update(visible=True)]
+            defaults_file = SONGGEN_DEFAULTS_FILE
+
+        # Load defaults for the selected backend
+        component_updates = [gr.update()] * total_components
+        status_msg = f"Switched to {backend}"
+
+        if os.path.exists(defaults_file):
+            try:
+                with open(defaults_file, 'r') as f:
+                    loaded = json.load(f)
+
+                if backend == "SongGeneration (LeVo)":
+                    # Load shared fields into heartmula component positions
+                    for idx, key in zip(shared_indices, shared_keys):
+                        if key in loaded:
+                            component_updates[idx] = gr.update(value=loaded[key])
+                    # Load songgen-only fields
+                    offset = len(heartmula_keys)
+                    for i, key in enumerate(songgen_only_keys):
+                        if key in loaded:
+                            component_updates[offset + i] = gr.update(value=loaded[key])
+                else:
+                    # Load HeartMuLa fields
+                    for i, key in enumerate(heartmula_keys):
+                        if key in loaded:
+                            component_updates[i] = gr.update(value=loaded[key])
+                status_msg = f"Switched to {backend} (defaults loaded)"
+            except Exception as e:
+                status_msg = f"Switched to {backend} (error loading defaults: {e})"
+        else:
+            status_msg = f"Switched to {backend} (no saved defaults)"
+
+        return visibility_updates + component_updates + [status_msg]
+
+    backend_selector.change(
+        fn=switch_backend_and_load_defaults,
+        inputs=[backend_selector],
+        outputs=[heartmula_settings, songgen_settings] + all_defaults_components + [status_text]
+    )
 
     def save_defaults(backend, *values):
         """Save current settings to defaults file based on backend."""

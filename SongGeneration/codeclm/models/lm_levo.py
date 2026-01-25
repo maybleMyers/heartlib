@@ -348,9 +348,10 @@ class LmModel(StreamingModule):
                  top_k: int = 250,
                  top_p: float = 0.0,
                  cfg_coef: tp.Optional[float] = None,
-                 check: bool = False,        
+                 check: bool = False,
                  record_tokens: bool = True,
-                 record_window: int = 150
+                 record_window: int = 150,
+                 initial_codes: tp.Optional[torch.Tensor] = None,  # img2img: pre-filled tokens [B, K, T]
                  ) -> torch.Tensor:
         """Generate tokens sampling from the model given a prompt or unconditionally. Generation can
         be perform in a greedy fashion or using sampling with top K and top P strategies.
@@ -399,8 +400,20 @@ class LmModel(StreamingModule):
         unknown_token = -1
         # we generate codes up to the max_gen_len that will be mapped to the pattern sequence
         B = num_samples
-        gen_codes = torch.full((B, self.code_depth, max_gen_len), 
-                               unknown_token, dtype=torch.long, device=device)
+
+        # img2img: use initial_codes if provided, otherwise start from unknown tokens
+        if initial_codes is not None:
+            gen_codes = initial_codes.to(device)
+            # Pad/truncate to max_gen_len if needed
+            if gen_codes.shape[-1] < max_gen_len:
+                pad = torch.full((B, self.code_depth, max_gen_len - gen_codes.shape[-1]),
+                                unknown_token, dtype=torch.long, device=device)
+                gen_codes = torch.cat([gen_codes, pad], dim=-1)
+            elif gen_codes.shape[-1] > max_gen_len:
+                gen_codes = gen_codes[..., :max_gen_len]
+        else:
+            gen_codes = torch.full((B, self.code_depth, max_gen_len),
+                                   unknown_token, dtype=torch.long, device=device)
         # create the gen_sequence with proper interleaving from the pattern: [B, K, S]
         gen_sequence, indexes, mask = pattern.build_pattern_sequence(gen_codes, self.special_token_id)
         output_codes = torch.full_like(gen_sequence, self.code_size)
