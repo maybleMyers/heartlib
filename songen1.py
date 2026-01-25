@@ -55,6 +55,7 @@ SONGGEN_STYLE_TYPES = ['Pop', 'R&B', 'Dance', 'Jazz', 'Folk', 'Rock', 'Chinese S
 
 # SongGeneration model options
 SONGGEN_MODELS = ['songgeneration_large', 'songgeneration_base', 'songgeneration_base_new', 'songgeneration_base_full']
+SONGGEN_CKPT_PATH = os.path.join(SONGGEN_PATH, "ckpt")  # Absolute path to SongGeneration checkpoints
 
 # SongGeneration Description Builder options
 SONGGEN_GENDERS = ['None', 'Male', 'Female']
@@ -555,6 +556,7 @@ def generate_music_songgen(
     bpm: int = 0,
     img2img_audio_path: str = None,
     img2img_strength: float = 1.0,
+    img2img_mode: str = "uniform",
 ):
     """Generate music using SongGeneration (LeVo) backend.
 
@@ -669,7 +671,7 @@ def generate_music_songgen(
         if ref_audio_path and os.path.isfile(ref_audio_path):
             log(f"Reference audio: {ref_audio_path}")
         if img2img_audio_path and os.path.isfile(img2img_audio_path):
-            log(f"img2img audio: {img2img_audio_path} (strength={img2img_strength})")
+            log(f"img2img audio: {img2img_audio_path} (mode={img2img_mode}, strength={img2img_strength})")
         log(f"Generate type: {generate_type}")
         log(f"Temperature: {temperature}, Top-K: {topk}, Top-P: {top_p}, CFG Scale: {cfg_scale}")
 
@@ -745,6 +747,11 @@ def generate_music_songgen(
         encoded_pmt = None
         encoded_vocal = None
         encoded_bgm = None
+
+        # For img2img vocal_replace mode - will hold separated audio
+        img2img_pmt_wav = None
+        img2img_vocal_wav = None
+        img2img_bgm_wav = None
 
         if use_ref_audio:
             yield (*create_audio_outputs([]), "Processing reference audio...")
@@ -1002,6 +1009,20 @@ def generate_music_songgen(
                     img2img_wav = torchaudio.functional.resample(img2img_wav, img2img_sr, 48000)
                 generate_inp['img2img_audio'] = img2img_wav.cuda()
                 generate_inp['img2img_strength'] = img2img_strength
+                generate_inp['img2img_mode'] = img2img_mode
+
+                # For vocal_replace/bgm_replace modes, separate the img2img audio for decoder
+                if img2img_mode in ["vocal_replace", "bgm_replace"]:
+                    yield (*create_audio_outputs(all_generated_music, labels), "Separating img2img audio...")
+                    from generate import Separator
+                    separator = Separator(
+                        dm_model_path=os.path.join(SONGGEN_PATH, 'third_party/demucs/ckpt/htdemucs.pth'),
+                        dm_config_path=os.path.join(SONGGEN_PATH, 'third_party/demucs/ckpt/htdemucs.yaml')
+                    )
+                    img2img_pmt_wav, img2img_vocal_wav, img2img_bgm_wav = separator.run(img2img_audio_path)
+                    del separator
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             # Reset offload profiler cache before generation if using offloading
             if use_offload and offload_profiler is not None:
@@ -1038,7 +1059,16 @@ def generate_music_songgen(
 
             # Generate audio from tokens
             with torch.no_grad():
-                if use_ref_audio:
+                # For img2img vocal_replace/bgm_replace modes, use separated img2img audio for decoding
+                if img2img_mode == "vocal_replace" and img2img_bgm_wav is not None:
+                    # Use img2img's BGM, but zero out vocals so they don't bleed through
+                    zero_vocal = torch.zeros_like(img2img_vocal_wav)
+                    wav_out = model.generate_audio(tokens, img2img_pmt_wav, zero_vocal, img2img_bgm_wav, chunked=True, gen_type=generate_type)
+                elif img2img_mode == "bgm_replace" and img2img_vocal_wav is not None:
+                    # Use img2img's vocals, but zero out BGM
+                    zero_bgm = torch.zeros_like(img2img_bgm_wav)
+                    wav_out = model.generate_audio(tokens, img2img_pmt_wav, img2img_vocal_wav, zero_bgm, chunked=True, gen_type=generate_type)
+                elif use_ref_audio:
                     wav_out = model.generate_audio(tokens, ref_pmt_wav, ref_vocal_wav, ref_bgm_wav, chunked=True, gen_type=generate_type)
                 else:
                     wav_out = model.generate_audio(tokens, chunked=True, gen_type=generate_type)
@@ -1071,6 +1101,7 @@ def generate_music_songgen(
                 "ref_audio_path": ref_audio_path if use_ref_audio else None,
                 "img2img_audio_path": img2img_audio_path if img2img_audio_path and os.path.isfile(img2img_audio_path) else None,
                 "img2img_strength": img2img_strength if img2img_audio_path and os.path.isfile(img2img_audio_path) else None,
+                "img2img_mode": img2img_mode if img2img_audio_path and os.path.isfile(img2img_audio_path) else None,
                 "generated_at": datetime.now().isoformat(),
                 "generation_time_seconds": end_time - start_time,
             }
@@ -1619,6 +1650,12 @@ with gr.Blocks(
                             value=0.5,
                             step=0.01,
                         )
+                        img2img_mode_dropdown = gr.Dropdown(
+                            label="img2img Mode",
+                            choices=["uniform", "vocal_replace", "bgm_replace"],
+                            value="uniform",
+                            info="uniform: modify all; vocal_replace: keep music, new vocals; bgm_replace: keep vocals, new music"
+                        )
                         normalize_loudness_checkbox = gr.Checkbox(
                             label="Normalize Loudness",
                             value=True,
@@ -1696,7 +1733,7 @@ with gr.Blocks(
                         with gr.Row():
                             songgen_ckpt_path = gr.Textbox(
                                 label="Checkpoint Path",
-                                value="./SongGeneration/ckpt",
+                                value=SONGGEN_CKPT_PATH,
                                 info="Path to SongGeneration ckpt directory"
                             )
                             songgen_model = gr.Dropdown(
@@ -2047,7 +2084,7 @@ with gr.Blocks(
         # HeartMuLa params
         model_path_val, model_version_val, num_gpu_blocks_val, model_dtype_val,
         compile_val, use_rl_val,
-        ref_audio_semantic_val, ref_audio_img2img_val, ref_strength_val, normalize_loudness_val, loudness_boost_val,
+        ref_audio_semantic_val, ref_audio_img2img_val, ref_strength_val, img2img_mode_val, normalize_loudness_val, loudness_boost_val,
         num_steps_val, ref_audio_sec_val,
         # SongGeneration params
         songgen_ckpt_path_val, songgen_model_val, songgen_style_val, songgen_generate_type_val,
@@ -2073,7 +2110,7 @@ with gr.Blocks(
                 songgen_flash_attn_val, songgen_gpu_blocks_val, songgen_generate_type_val,
                 songgen_style_val, ref_audio_semantic_val, songgen_compile_val,
                 songgen_top_p_val, songgen_gender_val, songgen_timbre_val, songgen_emotion_val, int(songgen_bpm_val),
-                img2img_audio_path=ref_audio_img2img_val, img2img_strength=ref_strength_val,
+                img2img_audio_path=ref_audio_img2img_val, img2img_strength=ref_strength_val, img2img_mode=img2img_mode_val,
             )
 
     generate_event = generate_btn.click(
@@ -2086,7 +2123,7 @@ with gr.Blocks(
             # HeartMuLa params
             model_path, model_version, num_gpu_blocks, model_dtype,
             compile_checkbox, use_rl_models_checkbox,
-            ref_audio_semantic, ref_audio_img2img, ref_strength_slider, normalize_loudness_checkbox, loudness_boost_slider,
+            ref_audio_semantic, ref_audio_img2img, ref_strength_slider, img2img_mode_dropdown, normalize_loudness_checkbox, loudness_boost_slider,
             num_steps_slider, ref_audio_sec_slider,
             # SongGeneration params
             songgen_ckpt_path, songgen_model, songgen_style, songgen_generate_type,
