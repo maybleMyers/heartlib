@@ -122,6 +122,9 @@ class GenerationParams:
     repainting_end: float = -1
     audio_cover_strength: float = 1.0
 
+    # Img2Img parameters - uses source audio as initial latent blended with noise
+    img2img_strength: float = 0.7  # 0.0=preserve source, 1.0=full generation (like text2music)
+
     # 5Hz Language Model Parameters
     thinking: bool = True
     lm_temperature: float = 0.85
@@ -359,7 +362,7 @@ def generate_music(
         # LM-based Chain-of-Thought reasoning
         # Skip LM for cover/repaint tasks - these tasks use reference/src audio directly
         # and don't need LM to generate audio codes
-        skip_lm_tasks = {"cover", "repaint"}
+        skip_lm_tasks = {"cover", "repaint", "img2img"}
         
         # Determine if we should use LLM
         # LLM is needed for:
@@ -571,6 +574,7 @@ def generate_music(
             shift=params.shift,
             infer_method=params.infer_method,
             timesteps=params.timesteps,
+            img2img_strength=params.img2img_strength,
             progress=progress,
         )
 

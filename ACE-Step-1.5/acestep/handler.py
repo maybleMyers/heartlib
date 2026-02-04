@@ -2142,6 +2142,8 @@ class AceStepHandler:
         audio_code_hints: Optional[Union[str, List[str]]] = None,
         infer_method: str = "ode",
         timesteps: Optional[List[float]] = None,
+        img2img_strength: float = 1.0,
+        img2img_latents: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
 
         """
@@ -2307,6 +2309,10 @@ class AceStepHandler:
             "cfg_interval_start": cfg_interval_start,
             "cfg_interval_end": cfg_interval_end,
             "shift": shift,
+            "img2img_strength": img2img_strength,
+            # For img2img mode: use target_latents (encoded source audio) as initial latent
+            # If img2img_latents was explicitly provided, use that; otherwise use target_latents when img2img_strength < 1.0
+            "img2img_latents": img2img_latents if img2img_latents is not None else (target_latents if img2img_strength < 1.0 and target_latents is not None else None),
         }
         # Add custom timesteps if provided (convert to tensor)
         if timesteps is not None:
@@ -2716,6 +2722,7 @@ class AceStepHandler:
         infer_method: str = "ode",
         use_tiled_decode: bool = True,
         timesteps: Optional[List[float]] = None,
+        img2img_strength: float = 1.0,
         progress=None
     ) -> Dict[str, Any]:
         """
@@ -2867,6 +2874,7 @@ class AceStepHandler:
                 audio_code_hints=audio_code_hints_batch,  # Pass audio code hints as list
                 return_intermediate=should_return_intermediate,
                 timesteps=timesteps,  # Pass custom timesteps if provided
+                img2img_strength=img2img_strength,  # Pass img2img strength
             )
             
             logger.info("[generate_music] Model generation completed. Decoding latents...")

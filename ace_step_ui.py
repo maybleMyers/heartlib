@@ -55,8 +55,8 @@ VALID_LANGUAGES = [
     'unknown', 'instrumental'
 ]
 
-TASK_TYPES_TURBO = ["text2music", "repaint", "cover"]
-TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complete"]
+TASK_TYPES_TURBO = ["text2music", "repaint", "cover", "img2img"]
+TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complete", "img2img"]
 
 TRACK_NAMES = [
     "woodwinds", "brass", "fx", "synth", "strings", "percussion",
@@ -72,6 +72,7 @@ TASK_INSTRUCTIONS = {
     "extract": "Extract the {TRACK_NAME} track from the audio:",
     "lego": "Generate the {TRACK_NAME} track based on the audio context:",
     "complete": "Complete the input track with {TRACK_CLASSES}:",
+    "img2img": "Transform the input audio based on the given conditions:",
 }
 
 # Maximum number of audio outputs in the UI
@@ -484,6 +485,8 @@ def generate_music(
     repainting_start: float = 0.0,
     repainting_end: float = -1,
     audio_cover_strength: float = 1.0,
+    # Img2img
+    img2img_strength: float = 0.7,
     # Advanced
     use_adg: bool = False,
     cfg_interval_start: float = 0.0,
@@ -564,9 +567,9 @@ def generate_music(
         all_seeds = seed_list.copy()
 
         # Create GenerationParams using ACE-Step inference API
-        # For cover/repaint tasks, LM is skipped (see inference.py:362-376), so pass audio_codes through
+        # For cover/repaint/img2img tasks, LM is skipped (see inference.py:362-376), so pass audio_codes through
         # For other tasks, only pass audio_codes if think is disabled (otherwise LM generates them)
-        skip_lm_tasks = {"cover", "repaint"}
+        skip_lm_tasks = {"cover", "repaint", "img2img"}
         use_audio_codes = audio_code_string if (task_type in skip_lm_tasks or not think) else ""
 
         gen_params = GenerationParams(
@@ -595,6 +598,7 @@ def generate_music(
             repainting_start=float(repainting_start),
             repainting_end=float(repainting_end),
             audio_cover_strength=float(audio_cover_strength),
+            img2img_strength=float(img2img_strength),
             thinking=think,
             lm_temperature=float(lm_temperature),
             lm_cfg_scale=float(lm_cfg_scale),
@@ -1149,9 +1153,15 @@ def build_interface():
                                     type="filepath",
                                 )
                                 src_audio = gr.Audio(
-                                    label="Source Audio (for cover/repaint)",
+                                    label="Source Audio (for cover/repaint/img2img)",
                                     type="filepath",
                                 )
+                            img2img_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.7, step=0.01,
+                                label="Img2Img Strength",
+                                info="0.0=preserve source structure, 1.0=full generation. Only used for img2img task.",
+                                visible=False
+                            )
                             with gr.Row():
                                 convert_to_codes_btn = gr.Button("Convert to Codes", variant="secondary")
 
@@ -1560,17 +1570,20 @@ def build_interface():
             show_complete = task_type_val == "complete"
             # Show repainting controls for repaint/lego/cover
             show_repaint = task_type_val in ["repaint", "lego", "cover"]
+            # Show img2img strength slider for img2img task
+            show_img2img = task_type_val == "img2img"
             return (
                 instruction,
                 gr.update(visible=show_track),
                 gr.update(visible=show_complete),
-                gr.update(visible=show_repaint)
+                gr.update(visible=show_repaint),
+                gr.update(visible=show_img2img)
             )
 
         task_type.change(
             fn=on_task_type_change,
             inputs=[task_type, track_name, complete_track_classes, init_llm_checkbox],
-            outputs=[instruction_display, track_name, complete_track_classes, repainting_accordion]
+            outputs=[instruction_display, track_name, complete_track_classes, repainting_accordion, img2img_strength]
         )
 
         # Update instruction when track_name changes
@@ -1676,6 +1689,7 @@ def build_interface():
                 task_type, instruction_display,
                 reference_audio, src_audio, audio_code_string,
                 repainting_start, repainting_end, audio_cover_strength,
+                img2img_strength,
                 use_adg, cfg_interval_start, cfg_interval_end,
                 think_checkbox, allow_lm_batch,
                 lm_temperature, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
