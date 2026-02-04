@@ -160,6 +160,18 @@ class HeartCodec(PreTrainedModel):
         for sinx in range(0, codes.shape[-1] - hop_samples + 1, hop_samples):
             codes_input = []
             codes_input.append(codes[:, :, sinx : sinx + min_samples])
+
+            # Slice ref_latent to correspond to current chunk's time position
+            # Codes are at 12.5 fps, latents are at 25 fps (2x), so multiply sinx by 2
+            chunk_ref_latent = None
+            if ref_latent is not None:
+                ref_start = sinx * 2  # Convert codes index to latent index
+                ref_end = ref_start + latent_length
+                if ref_start < ref_latent.shape[1]:
+                    chunk_ref_latent = ref_latent[:, ref_start:ref_end, :]
+                # If chunk_ref_latent is shorter than latent_length, flow_matching will tile it
+                # If ref_start >= ref_latent length, chunk_ref_latent stays None (pure generation)
+
             if sinx == 0 or ovlp_frames == 0:
                 incontext_length = first_latent_length
                 latents = self.flow_matching.inference_codes(
@@ -171,7 +183,7 @@ class HeartCodec(PreTrainedModel):
                     num_steps=num_steps,
                     disable_progress=disable_progress,
                     scenario="other_seg",
-                    ref_latent=ref_latent,
+                    ref_latent=chunk_ref_latent,
                     ref_strength=ref_strength,
                 )
                 latent_list.append(latents)
@@ -199,7 +211,7 @@ class HeartCodec(PreTrainedModel):
                     num_steps=num_steps,
                     disable_progress=disable_progress,
                     scenario="other_seg",
-                    ref_latent=ref_latent,
+                    ref_latent=chunk_ref_latent,
                     ref_strength=ref_strength,
                 )
                 latent_list.append(latents)
