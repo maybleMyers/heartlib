@@ -23,9 +23,9 @@
 ### to use ACE-Step
 
 
-git clone https://github.com/maybleMyers/heartlib
-uv run ace_step_ui.py
-
+git clone https://github.com/maybleMyers/heartlib  
+uv run ace_step_ui.py  
+  
 Some models will auto download, but if you want them all this is how your directory structure should be setup:  
 heartlib/ACE-Step-1.5/checkpoints$ dir  
 acestep-5Hz-lm-1.7B  acestep-captioner  acestep-v15-sft    acestep-v15-turbo-continuous  clone_huggingface_here.txt  console.txt           README.md
