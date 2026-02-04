@@ -76,7 +76,7 @@ TASK_INSTRUCTIONS = {
 }
 
 # Maximum number of audio outputs in the UI
-MAX_AUDIO_OUTPUTS = 8
+MAX_AUDIO_OUTPUTS = 10
 
 
 def stop_generation():
@@ -566,7 +566,8 @@ def generate_music(
                 seed_list.append(seed + i)
 
         all_seeds = seed_list.copy()
-
+        # Initialize lists for sequential generation
+        labels = []
         # Create GenerationParams using ACE-Step inference API
         # For cover/repaint/img2img tasks, LM is skipped (see inference.py:362-376), so pass audio_codes through
         # For other tasks, only pass audio_codes if think is disabled (otherwise LM generates them)
@@ -589,7 +590,7 @@ def generate_music(
             duration=duration_value,
             inference_steps=int(inference_steps),
             guidance_scale=float(guidance_scale),
-            seed=seed,
+            seed=seed, # This placeholder will be overridden by seeds in Config, or we handle it in loop
             use_adg=use_adg,
             cfg_interval_start=float(cfg_interval_start),
             cfg_interval_end=float(cfg_interval_end),
@@ -612,67 +613,77 @@ def generate_music(
             use_cot_language=use_cot_language,
         )
 
-        # Create GenerationConfig
-        gen_config = GenerationConfig(
-            batch_size=batch_count,
-            allow_lm_batch=allow_lm_batch,
-            use_random_seed=(seed == -1),
-            seeds=seed_list,
-            audio_format=audio_format,
-        )
-
-        status_text = f"Generating {batch_count} song(s)..."
-        yield (*create_audio_outputs([]), [], status_text)
-
         start_time = time.perf_counter()
+        
+        # Sequential Generation Loop
+        from acestep.audio_utils import AudioSaver
+        audio_saver = AudioSaver(default_format=audio_format)
 
-        # Call ACE-Step inference API
-        result = acestep_generate_music(
-            dit_handler,
-            llm_handler,
-            params=gen_params,
-            config=gen_config,
-        )
+        for i in range(batch_count):
+            if stop_event.is_set():
+                log("Generation stopped by user.")
+                yield (*create_audio_outputs(all_generated_music, labels), all_codes, "Stopped by user.")
+                return
 
-        # Check for stop
-        if stop_event.is_set():
-            log("Generation stopped by user.")
-            yield (*create_audio_outputs([]), [], "Stopped by user.")
-            return
+            current_seed = seed_list[i]
+            log(f"Generating song {i+1}/{batch_count} (Seed: {current_seed})...")
+            
+            # Update status in UI
+            yield (*create_audio_outputs(all_generated_music, labels), all_codes, f"Generating song {i+1}/{batch_count}...")
 
-        # Process result
-        if result.success and result.audios:
-            from acestep.audio_utils import AudioSaver
-            audio_saver = AudioSaver(default_format=audio_format)
+            # Configure for single generation
+            gen_config = GenerationConfig(
+                batch_size=1,
+                allow_lm_batch=False, # Force sequential for safety/VRAM
+                use_random_seed=False,
+                seeds=[current_seed],
+                audio_format=audio_format,
+            )
+            
+            # Note: We update the seed in params just in case, though config.seeds usually takes precedence
+            gen_params.seed = current_seed
 
-            for idx, audio_dict in enumerate(result.audios):
-                audio_tensor = audio_dict.get("tensor")
-                sample_rate = audio_dict.get("sample_rate", 48000)
-                codes = audio_dict.get("codes", "")
-                audio_seed = seed_list[idx] if idx < len(seed_list) else 0
+            # Call ACE-Step inference API for one song
+            result = acestep_generate_music(
+                dit_handler,
+                llm_handler,
+                params=gen_params,
+                config=gen_config,
+            )
 
-                if audio_tensor is not None:
-                    # Create output path
-                    timestamp = int(time.time())
-                    output_filename = f"acestep_{timestamp}_{audio_seed}.{audio_format}"
-                    output_path = os.path.join(output_folder, output_filename)
+            # Process result
+            if result.success and result.audios:
+                for audio_dict in result.audios:
+                    audio_tensor = audio_dict.get("tensor")
+                    sample_rate = audio_dict.get("sample_rate", 48000)
+                    codes = audio_dict.get("codes", "")
+                    
+                    if audio_tensor is not None:
+                        # Create output path
+                        timestamp = int(time.time())
+                        output_filename = f"acestep_{timestamp}_{current_seed}.{audio_format}"
+                        output_path = os.path.join(output_folder, output_filename)
 
-                    # Save audio to file
-                    saved_path = audio_saver.save_audio(
-                        audio_data=audio_tensor,
-                        output_path=output_path,
-                        sample_rate=sample_rate,
-                        format=audio_format,
-                    )
-                    all_generated_music.append(saved_path)
-                    all_codes.append(codes)
-                    log(f"Song {idx+1} saved to: {saved_path}")
-        else:
-            error_msg = result.error or result.status_message or "Unknown error"
-            log(f"Generation failed: {error_msg}")
+                        # Save audio to file
+                        saved_path = audio_saver.save_audio(
+                            audio_data=audio_tensor,
+                            output_path=output_path,
+                            sample_rate=sample_rate,
+                            format=audio_format,
+                        )
+                        all_generated_music.append(saved_path)
+                        all_codes.append(codes)
+                        labels.append(f"Song {len(all_generated_music)} (Seed: {current_seed})")
+                        log(f"Song {len(all_generated_music)} saved to: {saved_path}")
+            else:
+                error_msg = result.error or result.status_message or "Unknown error"
+                log(f"Generation failed for song {i+1}: {error_msg}")
+            
+            # Update UI after each song
+            yield (*create_audio_outputs(all_generated_music, labels), all_codes, f"Completed {i+1}/{batch_count}")
 
         elapsed = time.perf_counter() - start_time
-        log(f"Generation complete! ({elapsed:.1f}s)")
+        log(f"Batch generation complete! ({elapsed:.1f}s)")
 
         # Memory info
         if torch.cuda.is_available():
@@ -683,11 +694,10 @@ def generate_music(
         if all_generated_music:
             final_status = f"Completed {len(all_generated_music)} song(s)!"
         else:
-            final_status = result.status_message or "Generation failed"
+            final_status = "Generation failed."
 
         log(f"\n{'='*50}")
         log(final_status)
-        labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
         yield (*create_audio_outputs(all_generated_music, labels), all_codes, final_status)
 
     except Exception as e:
@@ -695,6 +705,7 @@ def generate_music(
         error_msg = f"Error during generation: {str(e)}"
         log(error_msg)
         log(traceback.format_exc())
+        # Reconstruct labels for partial results if crash occurred
         labels = [f"Song {j+1} (Seed: {all_seeds[j]})" for j in range(len(all_generated_music))]
         yield (*create_audio_outputs(all_generated_music, labels), all_codes, error_msg)
 
@@ -1292,7 +1303,7 @@ def build_interface():
                                     label="Time Signature"
                                 )
                             with gr.Row():
-                                batch_count = gr.Number(label="Batch Count", value=1, minimum=1, maximum=8, step=1)
+                                batch_count = gr.Number(label="Batch Count", value=1, minimum=1, maximum=10, step=1)
                                 seed = gr.Number(label="Seed (-1 = random)", value=-1)
                                 random_seed_btn = gr.Button("Random", scale=0, min_width=60)
 
@@ -1401,10 +1412,10 @@ def build_interface():
                             codes_displays = []
 
                             for i in range(MAX_AUDIO_OUTPUTS):
-                                with gr.Group(visible=(i < 2)) as audio_group:
+                                with gr.Group() as audio_group:
                                     audio_outputs.append(gr.Audio(
                                         label=f"Song {i+1}",
-                                        visible=(i < 2),
+                                        visible=(i < 2), # Initial state matches previous behavior
                                         interactive=False
                                     ))
                                     with gr.Row():
@@ -1898,6 +1909,8 @@ if __name__ == "__main__":
                         help="Server port. Auto-detects available port if not specified.")
     parser.add_argument("--share", action="store_true",
                         help="Create a public Gradio link.")
+    parser.add_argument("--addr", type=str, default="0.0.0.0",
+                        help="IP address to listen on (default: 0.0.0.0)")
     args = parser.parse_args()
 
     # Determine port
@@ -1906,13 +1919,16 @@ if __name__ == "__main__":
     else:
         port = find_available_port(7860)
 
-    print(f"Starting ACE-Step Gradio UI on port {port}...")
-    print(f"Open http://localhost:{port} in your browser")
+    print(f"Starting ACE-Step Gradio UI on {args.addr}:{port}...")
+    if args.addr == "0.0.0.0":
+        print(f"Open http://localhost:{port} in your browser")
+    else:
+        print(f"Open http://{args.addr}:{port} in your browser")
 
     demo.queue()
 
     demo.launch(
-        server_name="0.0.0.0",
+        server_name=args.addr, # Use the argument
         server_port=port,
         share=args.share,
         show_error=True,
