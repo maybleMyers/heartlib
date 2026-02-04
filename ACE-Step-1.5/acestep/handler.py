@@ -395,8 +395,24 @@ class AceStepHandler:
 
                 try:
                     logger.info(f"[initialize_service] Attempting to load model with attention implementation: {attn_implementation}")
+                    
+                    # First load the config to materialize any tensor attributes
+                    from transformers import AutoConfig
+                    config = AutoConfig.from_pretrained(
+                        acestep_v15_checkpoint_path,
+                        trust_remote_code=True
+                    )
+                    
+                    # Materialize any meta tensors in config
+                    if hasattr(config, 'quantizer_levels'):
+                        if isinstance(config.quantizer_levels, torch.Tensor) and config.quantizer_levels.is_meta:
+                            # Move to CPU to materialize
+                            config.quantizer_levels = config.quantizer_levels.to('cpu')
+                    
+                    # Now load the model with the pre-materialized config
                     self.model = AutoModel.from_pretrained(
                         acestep_v15_checkpoint_path, 
+                        config=config,  # Use the pre-loaded config
                         trust_remote_code=True, 
                         attn_implementation=attn_implementation,
                         dtype="bfloat16",

@@ -29,7 +29,7 @@ if ACE_STEP_PATH not in sys.path:
     sys.path.insert(0, ACE_STEP_PATH)
 
 # Import ACE-Step inference API
-from acestep.inference import generate_music as acestep_generate_music, GenerationParams, GenerationConfig, create_sample
+from acestep.inference import generate_music as acestep_generate_music, GenerationParams, GenerationConfig, create_sample, understand_music
 
 # Defaults file path
 ACE_STEP_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "acestep_defaults.json")
@@ -520,11 +520,11 @@ def convert_audio_to_codes(src_audio_path: str):
         if not src_audio_path:
             return "No audio file provided"
 
-        if hasattr(dit_handler, 'audio_to_codes'):
-            codes = dit_handler.audio_to_codes(src_audio_path)
+        if hasattr(dit_handler, 'convert_src_audio_to_codes'):
+            codes = dit_handler.convert_src_audio_to_codes(src_audio_path)
             return codes if codes else "Failed to convert audio to codes"
         else:
-            return "Audio to codes conversion not supported"
+            return "Audio to codes conversion not supported - DiT handler not initialized properly"
     except Exception as e:
         return f"Error converting audio: {e}"
 
@@ -536,12 +536,28 @@ def transcribe_audio(src_audio_path: str):
         if not src_audio_path:
             return "", "", "No audio file provided"
 
-        # This would call the transcription functionality
-        if hasattr(llm_handler, 'transcribe'):
-            result = llm_handler.transcribe(src_audio_path)
-            return result.get('lyrics', ''), result.get('caption', ''), "Transcription complete"
-        else:
-            return "", "", "Transcription not supported"
+        # First, convert audio to codes
+        if not hasattr(dit_handler, 'convert_src_audio_to_codes'):
+            return "", "", "Audio to codes conversion not supported - DiT handler not initialized properly"
+
+        codes_string = dit_handler.convert_src_audio_to_codes(src_audio_path)
+        if not codes_string or codes_string.startswith("❌"):
+            return "", "", f"Failed to convert audio to codes: {codes_string}"
+
+        # Then use understand_music API to get metadata from codes
+        result = understand_music(
+            llm_handler=llm_handler,
+            audio_codes=codes_string,
+            use_constrained_decoding=True,
+            constrained_decoding_debug=False,
+        )
+
+        if not result.success:
+            if result.error == "LLM not initialized":
+                return "", "", "LLM not initialized. Please initialize the LLM first."
+            return "", "", result.status_message
+
+        return result.lyrics, result.caption, "Transcription complete"
     except Exception as e:
         return "", "", f"Error transcribing: {e}"
 
@@ -1915,6 +1931,13 @@ def build_interface():
             fn=convert_audio_to_codes,
             inputs=[src_audio],
             outputs=[audio_code_string]
+        )
+
+        # Transcribe audio
+        transcribe_btn.click(
+            fn=transcribe_audio,
+            inputs=[src_audio],
+            outputs=[lyrics_input, caption_input, status_text]
         )
 
         # Format lyrics
