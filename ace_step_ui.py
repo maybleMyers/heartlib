@@ -29,7 +29,7 @@ if ACE_STEP_PATH not in sys.path:
     sys.path.insert(0, ACE_STEP_PATH)
 
 # Import ACE-Step inference API
-from acestep.inference import generate_music as acestep_generate_music, GenerationParams, GenerationConfig
+from acestep.inference import generate_music as acestep_generate_music, GenerationParams, GenerationConfig, create_sample
 
 # Defaults file path
 ACE_STEP_DEFAULTS_FILE = os.path.join(os.path.dirname(__file__), "acestep_defaults.json")
@@ -387,6 +387,71 @@ def generate_random_caption():
         return random.choice(captions)
     except Exception as e:
         return DEFAULT_CAPTION
+
+
+def handle_create_sample(
+    query: str,
+    instrumental: bool,
+    vocal_language: str,
+):
+    """Handle Create Sample button - convert natural language query to structured parameters."""
+    dit_handler, llm_handler, _ = get_handlers()
+
+    try:
+        # Check if LLM is initialized
+        if not llm_handler or not hasattr(llm_handler, 'llm_initialized') or not llm_handler.llm_initialized:
+            return (
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(),
+                "LLM not initialized. Please initialize the model with LLM enabled."
+            )
+
+        # Call create_sample API
+        result = create_sample(
+            llm_handler=llm_handler,
+            query=query,
+            instrumental=instrumental,
+            vocal_language=vocal_language,
+            temperature=0.85,
+            top_k=None,
+            top_p=0.9,
+            use_constrained_decoding=True,
+            constrained_decoding_debug=False,
+        )
+
+        # Handle error
+        if not result.success:
+            error_msg = result.status_message or "Sample creation failed"
+            log(f"Create sample error: {error_msg}")
+            return (
+                gr.update(), gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), error_msg
+            )
+
+        # Success - return structured data
+        log("Sample created successfully")
+        audio_duration = result.duration if result.duration and result.duration > 0 else -1
+
+        return (
+            result.caption or "",
+            result.lyrics or "",
+            result.bpm,
+            audio_duration,
+            result.keyscale or "",
+            result.language or vocal_language,
+            result.timesignature or "",
+            f"Sample created! Caption and metadata extracted from your description."
+        )
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Error creating sample: {str(e)}"
+        log(error_msg)
+        log(traceback.format_exc())
+        return (
+            gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), error_msg
+        )
 
 
 def generate_music(
@@ -1115,6 +1180,40 @@ def build_interface():
                                 info="Influence of reference audio/codes"
                             )
 
+                        # Simple Mode - Create Sample
+                        with gr.Accordion("Simple Mode - Create Sample", open=True):
+                            gr.Markdown("Describe your music in natural language, and AI will create the structured parameters for you.")
+                            with gr.Row():
+                                simple_query_input = gr.Textbox(
+                                    label="Music Description",
+                                    placeholder="e.g., An upbeat pop song about my cat with female vocals, acoustic guitar and piano",
+                                    lines=2,
+                                    scale=10
+                                )
+                            with gr.Row():
+                                simple_instrumental_checkbox = gr.Checkbox(
+                                    label="Instrumental",
+                                    value=False,
+                                    scale=1
+                                )
+                                simple_vocal_language = gr.Dropdown(
+                                    choices=VALID_LANGUAGES,
+                                    value="en",
+                                    label="Vocal Language",
+                                    allow_custom_value=True,
+                                    scale=2
+                                )
+                                create_sample_btn = gr.Button(
+                                    "🎨 Create Sample",
+                                    variant="primary",
+                                    scale=3
+                                )
+                            sample_status = gr.Textbox(
+                                label="Sample Status",
+                                interactive=False,
+                                lines=2
+                            )
+
                         # Caption & Lyrics
                         with gr.Accordion("Music Description", open=True):
                             with gr.Row():
@@ -1536,6 +1635,26 @@ def build_interface():
         random_caption_btn.click(
             fn=generate_random_caption,
             outputs=[caption_input]
+        )
+
+        # Create Sample button
+        create_sample_btn.click(
+            fn=handle_create_sample,
+            inputs=[
+                simple_query_input,
+                simple_instrumental_checkbox,
+                simple_vocal_language
+            ],
+            outputs=[
+                caption_input,
+                lyrics_input,
+                bpm,
+                duration,
+                key_scale,
+                vocal_language,
+                time_signature,
+                sample_status
+            ]
         )
 
         # Generate music
