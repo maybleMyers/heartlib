@@ -487,6 +487,7 @@ def generate_music(
     audio_cover_strength: float = 1.0,
     # Img2img
     img2img_strength: float = 0.7,
+    img2img_use_conditioning: bool = True,
     # Advanced
     use_adg: bool = False,
     cfg_interval_start: float = 0.0,
@@ -599,6 +600,7 @@ def generate_music(
             repainting_end=float(repainting_end),
             audio_cover_strength=float(audio_cover_strength),
             img2img_strength=float(img2img_strength),
+            img2img_use_conditioning=img2img_use_conditioning,
             thinking=think,
             lm_temperature=float(lm_temperature),
             lm_cfg_scale=float(lm_cfg_scale),
@@ -1156,12 +1158,19 @@ def build_interface():
                                     label="Source Audio (for cover/repaint/img2img)",
                                     type="filepath",
                                 )
-                            img2img_strength = gr.Slider(
-                                minimum=0.0, maximum=1.0, value=0.7, step=0.01,
-                                label="Img2Img Strength",
-                                info="0.0=preserve source structure, 1.0=full generation. Only used for img2img task.",
-                                visible=False
-                            )
+                            with gr.Row(visible=False) as img2img_row:
+                                img2img_strength = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.7, step=0.01,
+                                    label="Img2Img Strength",
+                                    info="0.0=preserve source, 1.0=full generation (exponential scaling)",
+                                    scale=3
+                                )
+                                img2img_use_conditioning = gr.Checkbox(
+                                    label="Use Source Conditioning",
+                                    value=True,
+                                    info="When off, source only affects starting noise, not generation guidance",
+                                    scale=1
+                                )
                             with gr.Row():
                                 convert_to_codes_btn = gr.Button("Convert to Codes", variant="secondary")
 
@@ -1583,7 +1592,7 @@ def build_interface():
         task_type.change(
             fn=on_task_type_change,
             inputs=[task_type, track_name, complete_track_classes, init_llm_checkbox],
-            outputs=[instruction_display, track_name, complete_track_classes, repainting_accordion, img2img_strength]
+            outputs=[instruction_display, track_name, complete_track_classes, repainting_accordion, img2img_row]
         )
 
         # Update instruction when track_name changes
@@ -1689,7 +1698,7 @@ def build_interface():
                 task_type, instruction_display,
                 reference_audio, src_audio, audio_code_string,
                 repainting_start, repainting_end, audio_cover_strength,
-                img2img_strength,
+                img2img_strength, img2img_use_conditioning,
                 use_adg, cfg_interval_start, cfg_interval_end,
                 think_checkbox, allow_lm_batch,
                 lm_temperature, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,

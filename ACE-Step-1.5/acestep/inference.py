@@ -123,7 +123,8 @@ class GenerationParams:
     audio_cover_strength: float = 1.0
 
     # Img2Img parameters - uses source audio as initial latent blended with noise
-    img2img_strength: float = 0.7  # 0.0=preserve source, 1.0=full generation (like text2music)
+    img2img_strength: float = 0.7  # 0.0=preserve source, 1.0=full generation (exponential scaling)
+    img2img_use_conditioning: bool = True  # If False, source only affects initial noise, not generation guidance
 
     # 5Hz Language Model Parameters
     thinking: bool = True
@@ -575,6 +576,7 @@ def generate_music(
             infer_method=params.infer_method,
             timesteps=params.timesteps,
             img2img_strength=params.img2img_strength,
+            img2img_use_conditioning=params.img2img_use_conditioning,
             progress=progress,
         )
 
