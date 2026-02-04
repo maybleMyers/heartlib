@@ -137,15 +137,19 @@ DEFAULT_CAPTION = "upbeat pop song, female vocals, happy mood, acoustic guitar, 
 
 def get_available_lm_models():
     """Scan checkpoints directory for available LM models."""
+    # Always include standard models
+    models = ["acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-4B"]
+
+    # Scan for additional models in checkpoints directory
     checkpoints_dir = os.path.join(ACE_STEP_PATH, "checkpoints")
-    models = []
     if os.path.exists(checkpoints_dir):
         for name in os.listdir(checkpoints_dir):
-            if name.startswith("acestep-5Hz-lm-"):
+            if name.startswith("acestep-5Hz-lm-") and name not in models:
                 models.append(name)
+
     # Sort by size (extract number from name)
     models.sort(key=lambda x: float(x.split("-")[-1].replace("B", "")) if x.split("-")[-1].replace("B", "").replace(".", "").isdigit() else 0)
-    return models if models else ["acestep-5Hz-lm-1.7B"]
+    return models
 
 
 def get_available_dit_models():
@@ -983,7 +987,7 @@ def build_interface():
                                 )
                                 device = gr.Dropdown(
                                     choices=["auto", "cuda", "cpu"],
-                                    value="auto",
+                                    value="cuda",
                                     label="Device",
                                 )
                             with gr.Row():
@@ -997,7 +1001,7 @@ def build_interface():
                                 backend = gr.Dropdown(
                                     label="LM Backend",
                                     choices=["vllm", "pt"],
-                                    value="vllm",
+                                    value="pt",
                                     info="vllm is faster, pt is more compatible"
                                 )
                             with gr.Row():
@@ -1042,7 +1046,8 @@ def build_interface():
                                     choices=TASK_TYPES_TURBO,
                                     value="text2music",
                                     label="Task Type",
-                                    info="Type of generation task"
+                                    info="Type of generation task",
+                                    allow_custom_value=True
                                 )
                                 track_name = gr.Dropdown(
                                     choices=TRACK_NAMES,
@@ -1206,12 +1211,12 @@ def build_interface():
                         # LM Parameters
                         with gr.Accordion("LM Parameters", open=True):
                             with gr.Row():
-                                think_checkbox = gr.Checkbox(label="Enable Thinking", value=True)
-                                allow_lm_batch = gr.Checkbox(label="Parallel Thinking", value=True)
-                                use_cot_caption = gr.Checkbox(label="Caption Rewrite", value=True)
+                                think_checkbox = gr.Checkbox(label="Enable Thinking", value=False)
+                                allow_lm_batch = gr.Checkbox(label="Parallel Thinking", value=False)
+                                use_cot_caption = gr.Checkbox(label="Caption Rewrite", value=False)
                             with gr.Row():
-                                use_cot_metas = gr.Checkbox(label="CoT Metas", value=True)
-                                use_cot_language = gr.Checkbox(label="CoT Language", value=True)
+                                use_cot_metas = gr.Checkbox(label="CoT Metas", value=False)
+                                use_cot_language = gr.Checkbox(label="CoT Language", value=False)
                             with gr.Row():
                                 lm_temperature = gr.Slider(
                                     minimum=0.0, maximum=2.0, value=0.85, step=0.1,
