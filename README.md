@@ -17,10 +17,22 @@
 </p>
 
 ### 🖥️ Web GUI
-![heartlib-gui](examples/screenshot.png)
-A Gradio-based web interface for easy music generation.  
 
-We recommend using `python=3.10` for local deployment.  
+![heartlib-gui](examples/screenshot.png)
+
+### to use ACE-Step
+
+
+git clone https://github.com/maybleMyers/heartlib
+uv run ace_step_ui.py
+
+Some models will auto download, but if you want them all this is how your directory structure should be setup:  
+heartlib/ACE-Step-1.5/checkpoints$ dir  
+acestep-5Hz-lm-1.7B  acestep-captioner  acestep-v15-sft    acestep-v15-turbo-continuous  clone_huggingface_here.txt  console.txt           README.md
+acestep-5Hz-lm-4B    acestep-v15-base   acestep-v15-turbo  acestep-v15-turbo-shift3      config.json                 Qwen3-Embedding-0.6B  vae
+
+
+
 install uv then:
 
 ```bash

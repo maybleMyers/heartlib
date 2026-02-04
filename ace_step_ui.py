@@ -58,6 +58,166 @@ VALID_LANGUAGES = [
 TASK_TYPES_TURBO = ["text2music", "repaint", "cover", "img2img"]
 TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complete", "img2img"]
 
+# Model configurations - maps model names to their HuggingFace repo paths
+DIT_MODEL_CONFIGS = {
+    "turbo": {
+        "config_path": "acestep-v15-turbo",
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_subfolder": "acestep-v15-turbo",
+        "is_turbo": True,
+    },
+    "base": {
+        "config_path": "acestep-v15-base",
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_subfolder": "acestep-v15-base",
+        "is_turbo": False,
+    },
+    "sft": {
+        "config_path": "acestep-v15-sft",
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_subfolder": "acestep-v15-sft",
+        "is_turbo": False,
+    },
+    "turbo-continuous": {
+        "config_path": "acestep-v15-turbo-continuous",
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_subfolder": "acestep-v15-turbo-continuous",
+        "is_turbo": True,
+    },
+    "turbo-shift3": {
+        "config_path": "acestep-v15-turbo-shift3",
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_subfolder": "acestep-v15-turbo-shift3",
+        "is_turbo": True,
+    },
+}
+
+LM_MODEL_CONFIGS = {
+    "acestep-5Hz-lm-1.7B": {
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-LM",
+        "hf_subfolder": "acestep-5Hz-lm-1.7B",
+    },
+    "acestep-5Hz-lm-4B": {
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-LM",
+        "hf_subfolder": "acestep-5Hz-lm-4B",
+    },
+}
+
+CAPTIONER_CONFIG = {
+    "acestep-captioner": {
+        "hf_repo": "ACE-Step/ACE-Step-v1-5-Captioner",
+        "hf_subfolder": "acestep-captioner",
+    },
+}
+
+EMBEDDING_CONFIG = {
+    "Qwen3-Embedding-0.6B": {
+        "hf_repo": "Qwen/Qwen3-Embedding-0.6B",
+        "hf_subfolder": None,
+    },
+}
+
+
+def download_model_if_needed(model_name: str, checkpoint_dir: str, model_type: str = "dit") -> Tuple[bool, str]:
+    """Download a model from HuggingFace if it doesn't exist locally.
+
+    Args:
+        model_name: Name of the model to download
+        checkpoint_dir: Directory to download to
+        model_type: Type of model ("dit", "lm", "captioner", "embedding")
+
+    Returns:
+        Tuple of (success, status_message)
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return False, "huggingface_hub not installed. Run: pip install huggingface_hub"
+
+    # Determine config based on model type
+    if model_type == "dit":
+        config = DIT_MODEL_CONFIGS.get(model_name)
+        if config:
+            local_path = os.path.join(checkpoint_dir, config["config_path"])
+        else:
+            return False, f"Unknown DiT model: {model_name}"
+    elif model_type == "lm":
+        config = LM_MODEL_CONFIGS.get(model_name)
+        if config:
+            local_path = os.path.join(checkpoint_dir, model_name)
+        else:
+            return False, f"Unknown LM model: {model_name}"
+    elif model_type == "captioner":
+        config = CAPTIONER_CONFIG.get(model_name)
+        if config:
+            local_path = os.path.join(checkpoint_dir, model_name)
+        else:
+            return False, f"Unknown captioner model: {model_name}"
+    elif model_type == "embedding":
+        config = EMBEDDING_CONFIG.get(model_name)
+        if config:
+            local_path = os.path.join(checkpoint_dir, model_name)
+        else:
+            return False, f"Unknown embedding model: {model_name}"
+    else:
+        return False, f"Unknown model type: {model_type}"
+
+    # Check if already exists
+    if os.path.exists(local_path) and os.listdir(local_path):
+        return True, f"Model already exists: {local_path}"
+
+    # Download from HuggingFace
+    try:
+        log(f"Downloading {model_name} from {config['hf_repo']}...")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        if config.get("hf_subfolder"):
+            # Download specific subfolder
+            snapshot_download(
+                repo_id=config["hf_repo"],
+                local_dir=checkpoint_dir,
+                allow_patterns=[f"{config['hf_subfolder']}/*"],
+            )
+        else:
+            # Download entire repo to subfolder
+            snapshot_download(
+                repo_id=config["hf_repo"],
+                local_dir=local_path,
+            )
+
+        log(f"Downloaded {model_name} successfully")
+        return True, f"Downloaded {model_name} to {local_path}"
+    except Exception as e:
+        return False, f"Failed to download {model_name}: {str(e)}"
+
+
+def ensure_dit_model_available(model_name: str, checkpoint_dir: str) -> Tuple[bool, str]:
+    """Ensure a DiT model is available, downloading if necessary."""
+    if model_name not in DIT_MODEL_CONFIGS:
+        return False, f"Unknown model: {model_name}. Available: {list(DIT_MODEL_CONFIGS.keys())}"
+
+    config = DIT_MODEL_CONFIGS[model_name]
+    local_path = os.path.join(checkpoint_dir, config["config_path"])
+
+    if os.path.exists(local_path) and os.listdir(local_path):
+        return True, f"Model available: {local_path}"
+
+    return download_model_if_needed(model_name, checkpoint_dir, "dit")
+
+
+def ensure_lm_model_available(model_name: str, checkpoint_dir: str) -> Tuple[bool, str]:
+    """Ensure an LM model is available, downloading if necessary."""
+    if model_name not in LM_MODEL_CONFIGS:
+        return False, f"Unknown LM model: {model_name}. Available: {list(LM_MODEL_CONFIGS.keys())}"
+
+    local_path = os.path.join(checkpoint_dir, model_name)
+
+    if os.path.exists(local_path) and os.listdir(local_path):
+        return True, f"LM model available: {local_path}"
+
+    return download_model_if_needed(model_name, checkpoint_dir, "lm")
+
+
 TRACK_NAMES = [
     "woodwinds", "brass", "fx", "synth", "strings", "percussion",
     "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"
@@ -154,14 +314,26 @@ def get_available_lm_models():
 
 
 def get_available_dit_models():
-    """Scan checkpoints directory for available DiT models."""
+    """Get all supported DiT model names.
+
+    Returns model short names (e.g., 'turbo', 'base') that can be used with DIT_MODEL_CONFIGS.
+    Models will be downloaded automatically when selected if not present.
+    """
+    # Return all supported model names from config
+    # Order: turbo variants first, then base variants
+    model_order = ["turbo", "turbo-continuous", "turbo-shift3", "base", "sft"]
+    return [m for m in model_order if m in DIT_MODEL_CONFIGS]
+
+
+def get_locally_available_dit_models():
+    """Scan checkpoints directory for locally available DiT models."""
     checkpoints_dir = os.path.join(ACE_STEP_PATH, "checkpoints")
-    models = []
-    if os.path.exists(checkpoints_dir):
-        for name in os.listdir(checkpoints_dir):
-            if name.startswith("acestep-v15-"):
-                models.append(name)
-    return models if models else ["acestep-v15-turbo", "acestep-v15-base"]
+    available = []
+    for model_name, config in DIT_MODEL_CONFIGS.items():
+        local_path = os.path.join(checkpoints_dir, config["config_path"])
+        if os.path.exists(local_path) and os.listdir(local_path):
+            available.append(model_name)
+    return available
 
 
 def get_available_checkpoints():
@@ -234,12 +406,28 @@ def initialize_service(
     dit_handler, llm_handler, _ = get_handlers()
 
     try:
-        # Map model type to config path
-        config_map = {
-            "turbo": "acestep-v15-turbo",
-            "base": "acestep-v15-base",
-        }
-        config_path = config_map.get(model_type, "acestep-v15-turbo")
+        # Get model config
+        if model_type not in DIT_MODEL_CONFIGS:
+            return f"Unknown model type: {model_type}. Available: {list(DIT_MODEL_CONFIGS.keys())}", gr.update(interactive=False)
+
+        model_config = DIT_MODEL_CONFIGS[model_type]
+        config_path = model_config["config_path"]
+
+        # Ensure DiT model is available (download if needed)
+        log(f"Checking DiT model availability: {model_type}")
+        success, msg = ensure_dit_model_available(model_type, checkpoint_path)
+        if not success:
+            return f"DiT model not available: {msg}", gr.update(interactive=False)
+        log(msg)
+
+        # Ensure LM model is available if requested
+        if init_llm:
+            log(f"Checking LM model availability: {lm_model}")
+            success, msg = ensure_lm_model_available(lm_model, checkpoint_path)
+            if not success:
+                log(f"Warning: LM model not available: {msg}")
+            else:
+                log(msg)
 
         # Quantization value
         quant_value = "int8_weight_only" if quantization else None
@@ -1068,14 +1256,23 @@ def build_interface():
                             with gr.Row():
                                 model_type = gr.Dropdown(
                                     label="Model Type",
-                                    choices=["turbo", "base"],
+                                    choices=get_available_dit_models(),
                                     value="turbo",
-                                    info="Turbo is faster, Base supports more task types"
+                                    info="Select DiT model variant",
+                                    scale=3
+                                )
+                                is_turbo_checkbox = gr.Checkbox(
+                                    label="Turbo",
+                                    value=True,
+                                    info="Checked = turbo model (faster)",
+                                    interactive=False,
+                                    scale=1
                                 )
                                 device = gr.Dropdown(
                                     choices=["auto", "cuda", "cpu"],
                                     value="cuda",
                                     label="Device",
+                                    scale=2
                                 )
                             with gr.Row():
                                 available_lm_models = get_available_lm_models()
@@ -1104,8 +1301,16 @@ def build_interface():
                                 offload_dit_cpu = gr.Checkbox(label="Offload DiT to CPU", value=True)
                                 quantization = gr.Checkbox(label="Int8 Quantization", value=True)
 
-                            init_btn = gr.Button("Initialize Model", variant="primary", elem_classes="green-btn")
+                            with gr.Row():
+                                init_btn = gr.Button("LOAD Model", variant="primary", elem_classes="green-btn")
+                                download_btn = gr.Button("Download Model", variant="secondary")
                             init_status = gr.Textbox(label="Init Status", interactive=False, lines=2)
+                            model_availability = gr.Textbox(
+                                label="Model Availability",
+                                value="Select a model to check availability",
+                                interactive=False,
+                                lines=1
+                            )
 
                         # LoRA Configuration
                         with gr.Accordion("LoRA Adapter", open=False):
@@ -1620,19 +1825,67 @@ def build_interface():
             outputs=[instruction_display]
         )
 
-        # Model type change - update task type choices
-        def on_model_type_change(model_type):
-            # Only update choices, don't reset the current value
-            # This preserves the user's task type selection when model type changes
-            if model_type == "turbo":
-                return gr.update(choices=TASK_TYPES_TURBO)
+        # Model type change - update task type choices and turbo checkbox
+        def on_model_type_change(model_type_val):
+            # Check if model is a turbo variant
+            is_turbo = False
+            if model_type_val in DIT_MODEL_CONFIGS:
+                is_turbo = DIT_MODEL_CONFIGS[model_type_val].get("is_turbo", False)
+
+            # Update task type choices based on turbo status
+            if is_turbo:
+                task_choices = gr.update(choices=TASK_TYPES_TURBO)
             else:
-                return gr.update(choices=TASK_TYPES_BASE)
+                task_choices = gr.update(choices=TASK_TYPES_BASE)
+
+            # Update turbo checkbox indicator
+            turbo_checkbox = gr.update(value=is_turbo)
+
+            return task_choices, turbo_checkbox
 
         model_type.change(
             fn=on_model_type_change,
             inputs=[model_type],
-            outputs=[task_type]
+            outputs=[task_type, is_turbo_checkbox]
+        )
+
+        # Check model availability when model type changes
+        def check_model_availability(model_type_val, checkpoint_path_val):
+            if model_type_val not in DIT_MODEL_CONFIGS:
+                return f"Unknown model: {model_type_val}"
+
+            config = DIT_MODEL_CONFIGS[model_type_val]
+            local_path = os.path.join(checkpoint_path_val, config["config_path"])
+
+            if os.path.exists(local_path) and os.listdir(local_path):
+                return f"✓ {model_type_val} is available locally"
+            else:
+                return f"⬇ {model_type_val} needs to be downloaded"
+
+        model_type.change(
+            fn=check_model_availability,
+            inputs=[model_type, checkpoint_path],
+            outputs=[model_availability]
+        )
+
+        # Download model button handler
+        def download_selected_model(model_type_val, lm_model_val, checkpoint_path_val):
+            messages = []
+
+            # Download DiT model
+            success, msg = ensure_dit_model_available(model_type_val, checkpoint_path_val)
+            messages.append(f"DiT ({model_type_val}): {msg}")
+
+            # Download LM model
+            success, msg = ensure_lm_model_available(lm_model_val, checkpoint_path_val)
+            messages.append(f"LM ({lm_model_val}): {msg}")
+
+            return "\n".join(messages)
+
+        download_btn.click(
+            fn=download_selected_model,
+            inputs=[model_type, lm_model, checkpoint_path],
+            outputs=[init_status]
         )
 
         # Initialize model
@@ -1880,6 +2133,21 @@ def build_interface():
             fn=initial_load_defaults,
             inputs=None,
             outputs=defaults_components
+        )
+
+        # Update model availability on startup
+        def initial_model_check():
+            # Check what's locally available
+            local_models = get_locally_available_dit_models()
+            if local_models:
+                return f"Available locally: {', '.join(local_models)}"
+            else:
+                return "No models downloaded. Click 'Download Model' or 'Initialize' to download."
+
+        demo.load(
+            fn=initial_model_check,
+            inputs=None,
+            outputs=[model_availability]
         )
 
     return demo
