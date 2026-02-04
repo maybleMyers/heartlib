@@ -564,12 +564,17 @@ def generate_music(
         all_seeds = seed_list.copy()
 
         # Create GenerationParams using ACE-Step inference API
+        # For cover/repaint tasks, LM is skipped (see inference.py:362-376), so pass audio_codes through
+        # For other tasks, only pass audio_codes if think is disabled (otherwise LM generates them)
+        skip_lm_tasks = {"cover", "repaint"}
+        use_audio_codes = audio_code_string if (task_type in skip_lm_tasks or not think) else ""
+
         gen_params = GenerationParams(
             task_type=task_type,
             instruction=instruction if instruction else DEFAULT_DIT_INSTRUCTION,
             reference_audio=reference_audio,
             src_audio=src_audio,
-            audio_codes=audio_code_string if not think else "",
+            audio_codes=use_audio_codes,
             caption=caption,
             lyrics=lyrics_to_use,
             instrumental=instrumental,
@@ -1584,10 +1589,12 @@ def build_interface():
 
         # Model type change - update task type choices
         def on_model_type_change(model_type):
+            # Only update choices, don't reset the current value
+            # This preserves the user's task type selection when model type changes
             if model_type == "turbo":
-                return gr.update(choices=TASK_TYPES_TURBO, value="text2music")
+                return gr.update(choices=TASK_TYPES_TURBO)
             else:
-                return gr.update(choices=TASK_TYPES_BASE, value="text2music")
+                return gr.update(choices=TASK_TYPES_BASE)
 
         model_type.change(
             fn=on_model_type_change,
