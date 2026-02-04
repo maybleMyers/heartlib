@@ -399,7 +399,8 @@ class AceStepHandler:
                         acestep_v15_checkpoint_path, 
                         trust_remote_code=True, 
                         attn_implementation=attn_implementation,
-                        dtype="bfloat16"
+                        dtype="bfloat16",
+                        low_cpu_mem_usage=False                        
                     )
                 except Exception as e:
                     logger.warning(f"[initialize_service] Failed to load model with {attn_implementation}: {e}")
