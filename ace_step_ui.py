@@ -62,51 +62,51 @@ TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complet
 DIT_MODEL_CONFIGS = {
     "turbo": {
         "config_path": "acestep-v15-turbo",
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
+        "hf_repo": "ACE-Step/Ace-Step1.5",
         "hf_subfolder": "acestep-v15-turbo",
         "is_turbo": True,
     },
     "base": {
         "config_path": "acestep-v15-base",
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
-        "hf_subfolder": "acestep-v15-base",
+        "hf_repo": "ACE-Step/acestep-v15-base",
+        "hf_subfolder": None,
         "is_turbo": False,
     },
     "sft": {
         "config_path": "acestep-v15-sft",
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
-        "hf_subfolder": "acestep-v15-sft",
+        "hf_repo": "ACE-Step/acestep-v15-sft",
+        "hf_subfolder": None,
         "is_turbo": False,
     },
     "turbo-continuous": {
         "config_path": "acestep-v15-turbo-continuous",
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
-        "hf_subfolder": "acestep-v15-turbo-continuous",
+        "hf_repo": "ACE-Step/acestep-v15-turbo-continuous",
+        "hf_subfolder": None,
         "is_turbo": True,
     },
     "turbo-shift3": {
         "config_path": "acestep-v15-turbo-shift3",
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Diffusion-Transformer",
-        "hf_subfolder": "acestep-v15-turbo-shift3",
+        "hf_repo": "ACE-Step/acestep-v15-turbo-shift3",
+        "hf_subfolder": None,
         "is_turbo": True,
     },
 }
 
 LM_MODEL_CONFIGS = {
     "acestep-5Hz-lm-1.7B": {
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-LM",
+        "hf_repo": "ACE-Step/Ace-Step1.5",
         "hf_subfolder": "acestep-5Hz-lm-1.7B",
     },
     "acestep-5Hz-lm-4B": {
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-LM",
-        "hf_subfolder": "acestep-5Hz-lm-4B",
+        "hf_repo": "ACE-Step/acestep-5Hz-lm-4B",
+        "hf_subfolder": None,
     },
 }
 
 CAPTIONER_CONFIG = {
     "acestep-captioner": {
-        "hf_repo": "ACE-Step/ACE-Step-v1-5-Captioner",
-        "hf_subfolder": "acestep-captioner",
+        "hf_repo": "ACE-Step/acestep-captioner",
+        "hf_subfolder": None,
     },
 }
 
