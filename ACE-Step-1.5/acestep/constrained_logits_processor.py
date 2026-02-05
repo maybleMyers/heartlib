@@ -21,6 +21,12 @@ from acestep.constants import (
 
 
 # ==============================================================================
+# Audio Code Constants
+# ==============================================================================
+MAX_AUDIO_CODE = 63999  # Maximum valid audio code value (codebook size = 64000)
+
+
+# ==============================================================================
 # FSM States for Constrained Decoding
 # ==============================================================================
 class FSMState(Enum):
@@ -522,21 +528,38 @@ class MetadataConstrainedLogitsProcessor(LogitsProcessor):
         """
         Precompute audio code token IDs (tokens matching <|audio_code_\\d+|>).
         These tokens should be blocked during caption generation.
+        Only tokens with code values in range [0, MAX_AUDIO_CODE] are included.
         """
         import re
-        audio_code_pattern = re.compile(r'^<\|audio_code_\d+\|>$')
-        
+        audio_code_pattern = re.compile(r'^<\|audio_code_(\d+)\|>$')
+        invalid_tokens_count = 0
+
         # Iterate through vocabulary to find audio code tokens
         for token_id in range(self.vocab_size):
             try:
                 token_text = self.tokenizer.decode([token_id])
-                if audio_code_pattern.match(token_text):
-                    self.audio_code_token_ids.add(token_id)
+                match = audio_code_pattern.match(token_text)
+                if match:
+                    # Extract code value from token text
+                    code_value = int(match.group(1))
+                    # Only add tokens with valid code values (0-63999)
+                    if 0 <= code_value <= MAX_AUDIO_CODE:
+                        self.audio_code_token_ids.add(token_id)
+                    else:
+                        invalid_tokens_count += 1
+                        if self.debug:
+                            logger.debug(f"Skipping audio code token {token_id} with invalid code value {code_value} (max: {MAX_AUDIO_CODE})")
             except Exception:
                 continue
-        
-        if self.debug:
-            logger.debug(f"Found {len(self.audio_code_token_ids)} audio code tokens")
+
+        if invalid_tokens_count > 0:
+            logger.warning(f"Found {invalid_tokens_count} audio code tokens with values outside valid range [0, {MAX_AUDIO_CODE}]")
+
+        # Log warning if no valid tokens found (this would prevent code generation)
+        if len(self.audio_code_token_ids) == 0:
+            logger.warning(f"No valid audio code tokens found in vocabulary (range [0, {MAX_AUDIO_CODE}]). Code generation may fail.")
+        elif self.debug:
+            logger.debug(f"Found {len(self.audio_code_token_ids)} valid audio code tokens (range [0, {MAX_AUDIO_CODE}])")
     
     def _build_audio_code_mask(self):
         """

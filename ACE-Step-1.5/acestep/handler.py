@@ -743,11 +743,26 @@ class AceStepHandler:
             return None
     
     def _parse_audio_code_string(self, code_str: str) -> List[int]:
-        """Extract integer audio codes from prompt tokens like <|audio_code_123|>."""
+        """Extract integer audio codes from prompt tokens like <|audio_code_123|>.
+        Code values are clamped to valid range [0, 63999] (codebook size = 64000).
+        """
         if not code_str:
             return []
         try:
-            return [int(x) for x in re.findall(r"<\|audio_code_(\d+)\|>", code_str)]
+            MAX_AUDIO_CODE = 63999  # Maximum valid audio code value (codebook size = 64000)
+            codes = []
+            clamped_count = 0
+            for x in re.findall(r"<\|audio_code_(\d+)\|>", code_str):
+                code_value = int(x)
+                # Clamp code value to valid range [0, MAX_AUDIO_CODE]
+                clamped_value = max(0, min(code_value, MAX_AUDIO_CODE))
+                if clamped_value != code_value:
+                    clamped_count += 1
+                    logger.warning(f"[_parse_audio_code_string] Clamped audio code value from {code_value} to {clamped_value}")
+                codes.append(clamped_value)
+            if clamped_count > 0:
+                logger.warning(f"[_parse_audio_code_string] Clamped {clamped_count} audio code value(s) to valid range [0, {MAX_AUDIO_CODE}]")
+            return codes
         except Exception as e:
             logger.debug(f"[_parse_audio_code_string] Failed to parse audio code string: {e}")
             return []
@@ -2774,16 +2789,6 @@ class AceStepHandler:
             if isinstance(v, list):
                 return any((x or "").strip() for x in v)
             return bool(v and str(v).strip())
-
-        # Auto-detect task type based on audio_code_string
-        # If audio_code_string is provided and not empty, use cover task
-        # Otherwise, use text2music task (or keep current task_type if not text2music)
-        if task_type == "text2music":
-            if _has_audio_codes(audio_code_string):
-                # User has provided audio codes, switch to cover task
-                task_type = "cover"
-                # Update instruction for cover task
-                instruction = TASK_INSTRUCTIONS["cover"]
 
         logger.info("[generate_music] Starting generation...")
         if progress:
