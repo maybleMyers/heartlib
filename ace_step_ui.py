@@ -477,27 +477,16 @@ def initialize_service(
         return error_msg, gr.update(interactive=False)
 
 
-def load_lora_adapter(lora_path: str, use_lora: bool, lora_scale: float):
+def load_lora_adapter(lora_path: str):
     """Load a LoRA adapter."""
     dit_handler, _, _ = get_handlers()
     try:
-        if not lora_path or not lora_path.strip():
-            return "Please provide a LoRA path", False, 1.0
-
-        if not os.path.exists(lora_path):
-            return f"LoRA path does not exist: {lora_path}", False, 1.0
-
-        # Call handler's load_lora method if it exists
         if hasattr(dit_handler, 'load_lora'):
-            success = dit_handler.load_lora(lora_path, scale=lora_scale)
-            if success:
-                return f"LoRA loaded: {os.path.basename(lora_path)}", True, lora_scale
-            else:
-                return "Failed to load LoRA", False, 1.0
+            return dit_handler.load_lora(lora_path)
         else:
-            return "LoRA loading not supported in this version", False, 1.0
+            return "LoRA loading not supported in this version"
     except Exception as e:
-        return f"Error loading LoRA: {e}", False, 1.0
+        return f"Error loading LoRA: {e}"
 
 
 def unload_lora_adapter():
@@ -505,12 +494,11 @@ def unload_lora_adapter():
     dit_handler, _, _ = get_handlers()
     try:
         if hasattr(dit_handler, 'unload_lora'):
-            dit_handler.unload_lora()
-            return "LoRA unloaded", False, 1.0
+            return dit_handler.unload_lora()
         else:
-            return "LoRA unloading not supported", False, 1.0
+            return "LoRA unloading not supported"
     except Exception as e:
-        return f"Error unloading LoRA: {e}", False, 1.0
+        return f"Error unloading LoRA: {e}"
 
 
 def convert_audio_to_codes(src_audio_path: str):
@@ -707,9 +695,6 @@ def generate_music(
     use_cot_metas: bool = True,
     use_cot_caption: bool = True,
     use_cot_language: bool = True,
-    # LoRA
-    use_lora: bool = False,
-    lora_scale: float = 1.0,
     # Output
     output_folder: str = "./output",
     audio_format: str = "mp3",
@@ -1508,7 +1493,7 @@ def build_interface():
                             with gr.Row():
                                 duration = gr.Slider(
                                     label="Duration (s)",
-                                    minimum=-1, maximum=300, value=-1, step=10,
+                                    minimum=-1, maximum=500, value=-1, step=1,
                                     info="-1 = auto"
                                 )
                                 inference_steps = gr.Slider(
@@ -1915,15 +1900,35 @@ def build_interface():
         )
 
         # LoRA handlers
+        dit_handler, _, _ = get_handlers()
+
         load_lora_btn.click(
             fn=load_lora_adapter,
-            inputs=[lora_path, use_lora_checkbox, lora_scale_slider],
-            outputs=[lora_status, use_lora_checkbox, lora_scale_slider]
+            inputs=[lora_path],
+            outputs=[lora_status]
+        ).then(
+            fn=lambda: gr.update(value=True),
+            outputs=[use_lora_checkbox]
         )
 
         unload_lora_btn.click(
             fn=unload_lora_adapter,
-            outputs=[lora_status, use_lora_checkbox, lora_scale_slider]
+            outputs=[lora_status]
+        ).then(
+            fn=lambda: gr.update(value=False),
+            outputs=[use_lora_checkbox]
+        )
+
+        use_lora_checkbox.change(
+            fn=dit_handler.set_use_lora,
+            inputs=[use_lora_checkbox],
+            outputs=[lora_status]
+        )
+
+        lora_scale_slider.change(
+            fn=dit_handler.set_lora_scale,
+            inputs=[lora_scale_slider],
+            outputs=[lora_status]
         )
 
         # Convert to codes
@@ -1990,7 +1995,6 @@ def build_interface():
                 think_checkbox, allow_lm_batch,
                 lm_temperature, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
                 use_cot_metas, use_cot_caption, use_cot_language,
-                use_lora_checkbox, lora_scale_slider,
                 output_folder, audio_format
             ],
             outputs=generate_outputs
